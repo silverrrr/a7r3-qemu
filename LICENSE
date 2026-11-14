@@ -21,9 +21,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ---------------------------------------------------------------------------
-例外 / Exception
+例外 / Exceptions
 
-`qemu/bionz.c` 是一个 QEMU 设备/机器模型，链接并运行于 QEMU 之上。
-QEMU 以 GNU GPL v2 发布，因此该文件按 **GPL-2.0-or-later** 分发，
-而不是上面的 MIT 条款。其余代码（payloads/、tools/、docs/）按 MIT 分发。
-详见 `qemu/README.md`。
+1. `qemu/bionz.c` 是一个 QEMU 设备/机器模型，链接并运行于 QEMU 之上。
+   QEMU 以 GNU GPL v2 发布，因此该文件按 **GPL-2.0-or-later** 分发，
+   而不是上面的 MIT 条款。该文件中的 Sugilite 2D 软件光栅化移植自
+   A7M3-Firmware-QEMU-Boot-Experiment（MIT），署名见文件头与 CREDITS.md。
+
+2. `payloads/menu_shell.c` 与 `payloads/menu_shell.h` 派生自
+   https://github.com/cokeenet/zve10-qemu ，其许可为
+   **PolyForm Noncommercial License 1.0.0**
+   （https://polyformproject.org/licenses/noncommercial/1.0.0）。
+   ⇒ **任何包含这两个文件的构建、组合或分发仅限非商业用途。**
+
+其余代码（payloads/ 下的其它文件、tools/、docs/）按上面的 MIT 条款分发。
+完整第三方清单见 CREDITS.md。
+

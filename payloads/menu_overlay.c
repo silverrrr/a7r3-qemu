@@ -1,3 +1,10 @@
+/* menu_overlay.c -- new-menu overlay for the A7R3.
+ *
+ * Original work (MIT).  It links the zve10-derived renderer in menu_shell.c,
+ * so builds that include menu_shell.c are noncommercial only
+ * (see CREDITS.md and LICENSE).
+ */
+
 /* menu_overlay.c -- draw a complete "new menu" onto the A7R3 panel.
  *
  * Renders 640x480 RGBA4444:

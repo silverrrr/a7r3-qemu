@@ -1,3 +1,17 @@
+/* a7r3-qemu: QEMU machine model for the Sony CXD90045 platform.
+ *
+ * The Sugilite 2D software rasterizer in this file (soft_draw / soft_exec and
+ * the opcode decoding, see cxd90045_sugi_*) was ported from
+ *     A7M3-Firmware-QEMU-Boot-Experiment
+ *     https://github.com/Derek2011cc/A7M3-Firmware-QEMU-Boot-Experiment
+ *     License: MIT
+ * with adaptations for the A7R3 (CXD90045) command lists, textures, Morton
+ * tiling and the blit/present registers.  The rest is original work.
+ *
+ * This file runs as part of QEMU and is therefore distributed under
+ * GPL-2.0-or-later (see ../LICENSE).
+ */
+
 /* QEMU model of Sony BIONZ image processors */
 
 #include "qemu/osdep.h"

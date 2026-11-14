@@ -1,3 +1,14 @@
+/* menu_shell.c -- A7C2-style menu renderer (title bar, tabs, rows).
+ *
+ * Derived from zve10-qemu/tools/zve10/menu/menu_shell.c
+ *     https://github.com/cokeenet/zve10-qemu
+ *     License: PolyForm Noncommercial License 1.0.0
+ *              (https://polyformproject.org/licenses/noncommercial/1.0.0)
+ *     => this file may be used for NONCOMMERCIAL purposes only.
+ *
+ * Changes for a7r3-qemu: panel format/layout hooks and label sources.
+ */
+
 #include "menu_shell.h"
 #include "original_assets.h"
 

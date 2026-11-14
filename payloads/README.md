@@ -4,7 +4,7 @@
 | --- | --- |
 | `gpu_shim_qemu.c` | `LD_PRELOAD` shim：观测 GPU ioctl、写面板、注入按键、读设置树 |
 | `menu_overlay.c` | 新菜单叠层：渲染、字符串、设值、触摸、自测、present 守卫 |
-| `menu_shell.c` | A7C2 风格界面绘制（标题栏、分类条、行、选中条） |
+| `menu_shell.c` / `.h` | A7C2 风格界面绘制；**派生自 [cokeenet/zve10-qemu](https://github.com/cokeenet/zve10-qemu)（PolyForm Noncommercial 1.0.0）**，见 [CREDITS.md](../CREDITS.md) |
 | `probe_menu.c` | M0 探针：遍历 456 个设置 root，dump 节点/属性 |
 | `shutter_hook*.c`、`normal_logdump.c` | 早期的观测实验，保留作参考 |
 

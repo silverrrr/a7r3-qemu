@@ -1,3 +1,10 @@
+/* gpu_shim_qemu.c -- LD_PRELOAD shim for the A7R3 camera process.
+ *
+ * Original work (MIT).  Loaded into im.elf via /bin/iperf's preload spec;
+ * observes GPU ioctls, writes the panel/flip buffers, injects keys and reads
+ * the settings tree through CautionConfig's exported API.
+ */
+
 /* Userland /dev/dmpgles2 shim for the A7R3 silent-shutter investigation.
  *
  * Loaded via LD_PRELOAD (console variant for QEMU).  Inert unless

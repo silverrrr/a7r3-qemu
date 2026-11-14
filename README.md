@@ -76,7 +76,21 @@ docs/
 - 叠层目前只覆盖 6 个设置项（示例），完整的 456 项分页尚未接完。
 - 不提供任何绕过设备保护措施的内容（引导链/恢复通道章节已删除）。
 
-## 6. 法律与合规
+## 6. 引用与致谢
+
+本项目的部分代码来自公开研究，**必须保留其署名与许可证**：
+
+| 来源 | 许可证 | 用在哪 |
+| --- | --- | --- |
+| [cokeenet/zve10-qemu](https://github.com/cokeenet/zve10-qemu) | **PolyForm Noncommercial 1.0.0** | `payloads/menu_shell.{c,h}` 是派生作品 ⇒ **含这两个文件的构建仅限非商业使用** |
+| [Derek2011cc/A7M3-Firmware-QEMU-Boot-Experiment](https://github.com/Derek2011cc/A7M3-Firmware-QEMU-Boot-Experiment) | MIT | `qemu/bionz.c` 的 Sugilite 2D 软件光栅化 |
+| [QEMU](https://www.qemu.org/) | GPL-2.0 | 机器模型的宿主 |
+| [ma1co/Sony-PMCA-RE](https://github.com/ma1co/Sony-PMCA-RE) | MIT | `tools/real-device/` 的外部依赖（未随仓库分发） |
+
+还有一批提供思路与资料的仓库（a7c2-qemu、a7m3-qemu、Sony_A7M3 等），
+完整清单、作者与许可证见 **[CREDITS.md](CREDITS.md)**。
+
+## 7. 法律与合规
 
 本项目仅用于**互操作性研究**与**自有设备**的界面实验：
 
