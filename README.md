@@ -1,0 +1,88 @@
+# a7r3-qemu
+
+在 QEMU 里运行 **Sony A7R3（ILCE-7RM3）原厂固件**，并在此基础上研究一套
+「A7C2 风格的新菜单叠层」：盖住原生 UI、不被原生渲染打断、能真正修改设置、支持触摸。
+
+> **本仓库不包含任何 Sony 固件、eMMC 镜像、字体、图标或其它专有资产。**
+> 运行需要你**自己合法获得**的固件；Sony / ILCE / A7R3 等商标归 Sony 所有。
+> 详见 [NOTICE.md](NOTICE.md)。
+
+---
+
+## 1. 成果一览（均在 QEMU + 自备固件中实测）
+
+| 能力 | 状态 | 证据 |
+| --- | --- | --- |
+| 原厂固件启动 + 原生 UI 显示 | ✅ | 自定义 `cxd90045` 机器模型 + Sugilite 2D 光栅化 |
+| 按键注入（脚本/串口） | ✅ | OSAL 消息队列路径 |
+| 新菜单叠层（640×480、中文） | ✅ | 写 panel + 两块 present 缓冲 |
+| 不被原生 UI 重绘打断 | ✅ | 20 ms present 金丝雀 + 立即重画 |
+| 显示真实设置名与真实值 | ✅ | 固件自带字体 + 自带字符串表 |
+| 真正修改设置 | ✅ | `CmnViewSettingNode::setItemSelectedBySRNum` |
+| 触摸（点选 / 双击应用 / 切分类） | ✅ | 轮询 `libObj+0x0129eb20` 的 (x, y) |
+| 真机验证 | ⏳ | 需要一次真机会话（触摸尺度、60 fps 闪烁） |
+
+## 2. 原理
+
+```
+启动：u-boot → Linux → initrd → /usr/bin/... → im.elf
+         └─ 我们提供 cxd90045 机器模型（LCD / Sugilite 2D / eMMC / DDR）
+
+显示：App 绘制 → grm_gles / Sugilite 2D → 0x202E0200（渲染目标）
+      → present blit → 0x23A80000 / 0x23B16000（双缓冲）
+
+叠层：/usr/tool/libefence.so（LD_PRELOAD 进 im.elf）
+      ├─ 读设置树：CautionConfig.so 导出的 456 个 cmnViewSettingNodeRoot*
+      ├─ 取文案：resid 0x02xxxxxx → 0x1E|low24 → string_simplifiedchinese.uxc
+      ├─ 画文字：从固件 .ltt 容器抽出的 TrueType → 4-bit 字形图集
+      ├─ 写画面：/dev/mem 写 0x202E0200 + 两块 flip 缓冲
+      ├─ 改设置：setItemSelectedBySRNum(SR)（固件自己的 API）
+      └─ 触摸：轮询 libObj+0x0129eb20 的 (x, y)
+```
+
+## 3. 仓库结构
+
+```
+payloads/            注入到相机进程里的 .so 源码
+  menu_overlay.c       新菜单叠层（渲染/字符串/设值/触摸/自测）
+  menu_shell.c         A7C2 风格界面绘制
+  gpu_shim_qemu.c      LD_PRELOAD shim（GPU ioctl 观测、面板写、按键）
+  probe_menu.c         M0 探针（读设置树、dump 节点/属性）
+  scripts/             构建 / 安装脚本
+qemu/
+  bionz.c              cxd90045 机器模型（LCD/Sugilite 2D/eMMC/DDR 等）
+tools/                 离线分析与解码工具（固件解包、UXC/字体、命令流、RAM dump）
+docs/
+  SUMMARY.md           做了什么 + 踩过的坑（推荐先读）
+  A7R3_NOTES.md        完整技术笔记（公开版：已删除引导/恢复章节）
+  HANDOFF.md           项目状态与工具索引
+```
+
+## 4. 快速开始
+
+> 需要：Linux（WSL 可用）、QEMU 源码树、`clang`/`lld`（ARM 交叉）、Python 3 + Pillow，
+> 以及**你自己的** A7R3 固件（eMMC 镜像、内核与 initrd）。
+
+1. 把 `qemu/bionz.c` 放进 QEMU 的 `hw/arm/`，并在 `hw/arm/Makefile.objs` 与
+   `default-configs/arm-softmmu.mak` 里注册 `cxd90045` 机器（见 `qemu/README.md`）。
+2. 用 `payloads/scripts/build-shim*.sh`、`build-newmenu.sh` 构建 payload。
+3. 字体/图标等素材**不随仓库提供**：按 `docs/SUMMARY.md` 第 5 节从你自己的固件里生成。
+4. 用 `tools/` 里的脚本启动、注入按键、抓帧、解码。
+
+## 5. 已知限制
+
+- 只在 QEMU 中验证；真机差异（触摸坐标尺度、60 fps present 下的闪烁窗口、
+  原生触控 AF 干扰）尚未验证。
+- 叠层目前只覆盖 6 个设置项（示例），完整的 456 项分页尚未接完。
+- 不提供任何绕过设备保护措施的内容（引导链/恢复通道章节已删除）。
+
+## 6. 法律与合规
+
+本项目仅用于**互操作性研究**与**自有设备**的界面实验：
+
+- 不含 Sony 固件或任何专有资产，不提供下载；
+- 不要在未授权设备上使用；不要用于绕过版权保护或签名校验；
+- 反编译/分析在部分司法辖区受当地法律与许可协议约束，使用前请自行确认合规；
+- 因使用本仓库导致的任何后果由使用者自负。
+
+详见 [NOTICE.md](NOTICE.md)。

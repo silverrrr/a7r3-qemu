@@ -1,0 +1,50 @@
+# 固件 / 镜像 / 资产：一律不入库
+*.bin
+*.img
+*.raw
+*.elf
+*.so
+*.ko
+*.o
+*.a
+*.dylib
+*.dll
+*.exe
+
+# Sony 专有资产
+*.ltt
+*.ttf
+*.otf
+*.ttc
+*.uxc
+*.uxd
+*.dat
+
+# 由固件派生的生成物（仓库只放生成脚本）
+payloads/font_atlas.h
+payloads/menu_labels.h
+payloads/menu_digits.h
+payloads/original_assets.h
+
+# 抓帧 / dump / 日志
+frame_*.png
+*_frames/
+*_cmds/
+dumps/
+extracted/
+logs/
+*.log
+*.err
+*.raw
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
