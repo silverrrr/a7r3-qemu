@@ -5781,3 +5781,24 @@ guest 异常/竞态（`0x152c38` 与 `0x0` 各一次），无法判断是新代�
   dlopen 成功），差的只是把 `el_base`/符号解析调通并跑通两次干净启动。
 - 下次继续时：先只替换 `libobj_base()`/`resolve_commit()` 两处（不碰 456 项枚举），
   确认单段式仍正常；再替换枚举；最后再试两段式。
+
+### 66.12 Step 1 实施与两次验证尝试（2026-11-15 傍晚）
+
+按"一次只动一处"的计划先改了 `libobj_base()` / `resolve_commit()` 两处（不碰 456 项
+枚举），代码在 `qemu_a7r3/patch-step1-reflection.py`。两次验证启动都没能走到
+"点开菜单"：
+
+| 尝试 | 现象 |
+| --- | --- |
+| 第 1 次 | 菜单没打开；`/tmp` 已满（766/766 簇）=> 按键文件写不进去。日志显示 `NM_items=456`，说明载荷本身正常 |
+| 第 2 次 | guest 撞 `0x152c38` 启动竞态；随后 viewer 进程随父 shell 退出 |
+
+顺手修了两个环境问题：
+
+- `fsck-guest-tmp.sh clean`：12 MB 的 `/tmp` 会被 `hook.log`/`newmenu.log` 塞满，
+  表现和"叠层不响应点击"一模一样；clean 会删掉日志（本次 12.2 MB -> 6.2 MB）。
+- `boot-until-ready.sh`：自动重试那个 ~1/3 概率的启动竞态（最多 N 次）。
+
+结论：**载荷回滚到 796ae5c 的验证版本**（step 1 补丁留在脚本里单独跑）。
+下次验证 step 1 的顺序：`fsck-guest-tmp.sh clean` -> `boot-until-ready.sh` ->
+viewer 就绪后再点右上角 -> 看 `NM_getsr` 是否非 0、行值是否为真实值。
