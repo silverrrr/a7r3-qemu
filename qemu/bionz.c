@@ -1319,7 +1319,7 @@ static void cxd90045_sugi_blit(CXD90045SugiState *s)
 
     if (getenv("A7R3_BLIT_LOG")) {
         static unsigned blit_log_n;
-        if (blit_log_n < 400) {
+        if (blit_log_n < 5000) {
             blit_log_n++;
             fprintf(stderr,
                     "CMDBLIT t=%lld n=%u src=%08x dst=%08x %ux%u fmt=%08x %s\n",

@@ -539,7 +539,12 @@ def main():
     stop = threading.Event()
 
     def frame_score(path):
-        """Cheap "how much is drawn" metric: count non-zero sampled bytes."""
+        """How much is actually drawn: count pixels whose RGB is non-zero.
+
+        The alpha nibble of an RGBA4444 pixel is always 0xf, so testing raw
+        bytes for "non-zero" marks even a black screen as full.  Byte 0 is
+        (G<<4)|A and byte 1 is (R<<4)|B, hence the mask.
+        """
         try:
             with open(path, "rb") as f:
                 data = f.read()
@@ -547,42 +552,48 @@ def main():
             return -1
         n = 0
         for i in range(0, len(data) - 1, 32):
-            if data[i] or data[i + 1]:
+            if (data[i] & 0xF0) or data[i + 1]:
                 n += 1
         return n
 
     def pick_best_frame(window=4.0):
-        """Newest recent frame that is not blank.
+        """Pick the frame to show.
 
-        The model dumps three surfaces (render target + both present buffers).
-        A caution dialog is mostly black (a few white glyphs), while a stale
-        buffer may still hold the full menu -- so "most pixels" is the wrong
-        metric: take the *newest* frame that has any content at all and skip the
-        blank ones.
+        The model dumps three surfaces per tick: the app's render target
+        (frame_8xxx) and the two present buffers (frame_7xxx / frame_6xxx).
+        What the *screen* shows is a present buffer, so those win whenever they
+        hold something; the render target is only a fallback (it may contain just
+        our corner badge, which is otherwise the newest "non-blank" frame and
+        would make the view look black).
         """
         now = time.time()
-        cands = []
+        groups = {"present": [], "target": []}
         try:
             names = os.listdir(rawdir)
         except FileNotFoundError:
             return None, 0.0
         for n in names:
-            if not n.endswith(".raw"):
+            if not n.startswith("frame_") or not n.endswith(".raw"):
+                continue
+            try:
+                idx = int(n[6:10])
+            except ValueError:
                 continue
             p = os.path.join(rawdir, n)
             try:
                 m = os.path.getmtime(p)
             except OSError:
                 continue
-            if now - m <= window:
-                cands.append((m, p))
-        if not cands:
-            return None, 0.0
-        cands.sort()
-        for m, p in reversed(cands):
-            if frame_score(p) > 40:
-                return p, m
-        return cands[-1][1], cands[-1][0]
+            if now - m > window:
+                continue
+            key = "target" if idx >= 8000 else "present"
+            groups[key].append((m, p))
+        for key in ("present", "target"):
+            cands = sorted(groups[key])
+            for m, p in reversed(cands):
+                if frame_score(p) > 100:
+                    return p, m
+        return None, 0.0
 
     def watch():
         last = None
