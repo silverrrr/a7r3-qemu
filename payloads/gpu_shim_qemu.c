@@ -255,8 +255,8 @@ static int has_prefix(const char *s, const char *p)
 
 static int log_open(void)
 {
-    static const char *paths[] = { "/setting/hook.log", "/log/hook.log",
-                                   "/tmp/hook.log", 0 };
+    static const char *paths[] = { "/tmp/hook.log", "/log/hook.log",
+                                   "/setting/hook.log", 0 };
     int i;
     if (log_fd >= 0)
         return log_fd;

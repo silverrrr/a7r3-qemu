@@ -115,9 +115,13 @@ static int log_open(void)
 
 static void out(const char *s, int n)
 {
-    sys3(SYS_write, 1, (long)s, n);
-    if (log_open() >= 0)
+    /* log file only: writing to the console floods the guest shell's tty and
+     * makes /sh output unreadable */
+    if (log_open() >= 0) {
         sys3(SYS_write, g_log, (long)s, n);
+        return;
+    }
+    sys3(SYS_write, 1, (long)s, n);
 }
 
 static void log_hex(const char *prefix, unsigned long v)
@@ -279,73 +283,51 @@ static void label(int x, int y, const struct ov_label *t, uint16_t color)
 }
 
 /* ------------------------------------------------------------------ */
-/* input: hook snd_InfraInputEvent_to_InputServant (libObj)             */
+/* "old menu <-> new menu" switch button, top-right corner             */
 /*                                                                     */
-/* Prologue is `b5f0 b083 af00 4604` -- four 16-bit instructions, no    */
-/* PC-relative load -- so an 8-byte jump plus a copied trampoline is    */
-/* safe.  Keys injected through the OSAL queue also end up here, which  */
-/* makes this the observation point for real buttons too.              */
+/* The same 44x44 button is drawn in both states: inside the overlay   */
+/* frame while it is open, and as a small patch over the native screen */
+/* while it is closed (see badge_tick).  Tapping that corner toggles.  */
 /* ------------------------------------------------------------------ */
 
-#define SYS_mprotect 125
-#define SYS_cacheflush 0x0f0002
-#define PROT_RWX 7
-#define PROT_RX 5
+#define SW_BTN 44
+#define SW_BTN_X (MENU_W - SW_BTN - 4)   /* 592 */
+#define SW_BTN_Y 4
+#define SW_TAP_X (SW_BTN_X - 8)          /* generous touch box */
+#define SW_TAP_Y (SW_BTN_Y + SW_BTN + 4)
 
-typedef long (*servant_fn)(long, long, long, long);
-static servant_fn g_servant_orig;
-static int g_servant_hooked;
-static int g_servant_events;
-
-static void icache_flush(void *start, unsigned long len)
+/* filled triangle (dir = +1 points right, -1 points left) in a 12x12 box */
+static void tri(int x, int y, int dir, uint16_t color)
 {
-    sys3(SYS_cacheflush, (long)start, (long)start + (long)len, 0);
-}
-
-static int wide16(unsigned hw)
-{
-    return (hw & 0xF800u) == 0xE800u || (hw & 0xF800u) == 0xF000u;
-}
-
-static int hook_thumb(unsigned long target, void *repl, void **orig)
-{
-    unsigned char *code;
-    void *page;
-    unsigned i;
-    unsigned short *addr = (unsigned short *)target;
-
-    if (!target || (target & 3u))
-        return -1;
-    for (i = 0; i < 4; i++)
-        if (wide16(addr[i]))
-            return -2;
-    code = (unsigned char *)sys4(SYS_mmap2, 0, 4096, PROT_RWX, 0x22, -1, 0);
-    if ((long)code < 0 && (long)code > -4096)
-        return -3;
-    for (i = 0; i < 8; i++)
-        code[i] = ((unsigned char *)target)[i];
-    code[8] = 0xdf;
-    code[9] = 0xf8;
-    code[10] = 0x00;
-    code[11] = 0xf0;
-    *(unsigned *)(code + 12) = (unsigned)(target + 8u) | 1u;
-    icache_flush(code, 32);
-    *orig = (void *)((unsigned long)code | 1u);
-
-    page = (void *)(target & ~4095UL);
-    if (sys3(SYS_mprotect, (long)page, 8192u, PROT_RWX) < 0)
-        return -5;
-    {
-        unsigned short *p = (unsigned short *)target;
-        p[0] = 0xdf;
-        p[1] = 0xf8;
-        p[2] = 0x00;
-        p[3] = 0xf0;
-        *(unsigned *)(target + 4) = (unsigned)(unsigned long)repl;
+    int dy;
+    for (dy = 0; dy < 12; dy++) {
+        int d = dy - 5;
+        int span;
+        if (d < 0)
+            d = -d;
+        span = 12 - d;
+        if (dir > 0)
+            rect((struct box){ x, y + dy, span, 1 }, color);
+        else
+            rect((struct box){ x + 12 - span, y + dy, span, 1 }, color);
     }
-    icache_flush((void *)page, 8192);
-    sys3(SYS_mprotect, (long)page, 8192u, PROT_RX);
-    return 0;
+}
+
+/* two arrows pointing opposite ways = "exchange" */
+static void draw_switch_icon(int x, int y, int active)
+{
+    uint16_t fill = active ? 0x1b4e : 0x0c26;
+    uint16_t line = 0xffff;
+    uint16_t edge = active ? 0x7d3f : 0x555f;
+
+    rect((struct box){ x, y, SW_BTN, SW_BTN }, edge);
+    rect((struct box){ x + 1, y + 1, SW_BTN - 2, SW_BTN - 2 }, fill);
+    /* top arrow: shaft + head pointing right */
+    rect((struct box){ x + 8, y + 14, 16, 2 }, line);
+    tri(x + 22, y + 9, 1, line);
+    /* bottom arrow: shaft + head pointing left */
+    rect((struct box){ x + 20, y + 28, 16, 2 }, line);
+    tri(x + 10, y + 23, -1, line);
 }
 
 static int plausible(const void *p)
@@ -354,64 +336,13 @@ static int plausible(const void *p)
     return v >= 0x10000UL && v < 0x80000000UL && (v & 1u) == 0;
 }
 
-static long servant_wrapper(long a, long b, long c, long d)
-{
-    if (g_servant_events < 24) {
-        long args[4];
-        int i;
-        g_servant_events++;
-        args[0] = a; args[1] = b; args[2] = c; args[3] = d;
-        log_hex("NM_EVT a=", (unsigned long)a);
-        log_hex("NM_EVT b=", (unsigned long)b);
-        log_hex("NM_EVT c=", (unsigned long)c);
-        log_hex("NM_EVT d=", (unsigned long)d);
-        /* dump the first words of every argument that looks like a pointer */
-        for (i = 0; i < 4; i++) {
-            const unsigned *w;
-            if (!plausible((const void *)args[i]))
-                continue;
-            w = (const unsigned *)args[i];
-            log_hex("NM_PTR w0=", w[0]);
-            log_hex("NM_PTR w1=", w[1]);
-            log_hex("NM_PTR w2=", w[2]);
-            log_hex("NM_PTR w3=", w[3]);
-        }
-    }
-    /* observation build: do not forward, so a wrong trampoline cannot take the
-     * UI down while we learn the ABI */
-    return 0;
-}
-
-static void hook_input(void)
-{
-    void *obj;
-    void *fn;
-    void *orig = NULL;
-    int rc;
-
-    if (g_servant_hooked)
-        return;
-    if (!file_exists("/setting/nm_observe")) {
-        g_servant_hooked = 1;
-        out("NM_HOOK_OFF\n", 12);
-        return;
-    }
-    g_servant_hooked = 1;
-    obj = dlopen ? dlopen("/usr/lib/libObj.so", 5) : NULL;
-    log_hex("NM_obj=", (unsigned long)obj);
-    if (!obj)
-        return;
-    fn = dlsym(obj, "snd_InfraInputEvent_to_InputServant");
-    log_hex("NM_servant=", (unsigned long)fn);
-    if (!fn)
-        return;
-    rc = hook_thumb((unsigned long)fn & ~1u, (void *)servant_wrapper, &orig);
-    log_hex("NM_hook_rc=", (unsigned long)rc);
-    if (rc == 0)
-        g_servant_orig = (servant_fn)orig;
-}
-
-
+/* NOTE (2026-11-15): an earlier build patched
+ * snd_InfraInputEvent_to_InputServant to see the physical MENU key.  It hooked
+ * fine (rc=0) but the guest dropped into its exception shell on the first key
+ * press: that function is on a hot path, so an 8-byte code patch can be hit
+ * mid-execution (same failure mode as A7R3_NOTES 49).  The hook is gone;
+ * "MENU = back" is now derived from the *present* the native UI makes when it
+ * reacts to a key -- see native_presented() below. */
 
 struct node {
     unsigned vptr;
@@ -437,23 +368,78 @@ struct props {
     int count;
 };
 
-/* row -> setting-node prototype (A7R3 CautionConfig.so exports) */
-static const char *const g_row_syms[6] = {
-    "cmnViewSettingNodeRootRawFileType",
-    "cmnViewSettingNodeRootStlImageJPEGQuality",
-    "cmnViewSettingNodeRootStillImageSize",
-    "cmnViewSettingNodeRootStlImageAspectRatio",
-    "cmnViewSettingNodeRootStillPanoramaImageSize",
-    "cmnViewSettingNodeRootStlImageQuality",
+/* Setting nodes per category page (6 rows each).  All names are exported by
+ * CautionConfig.so; anything that does not resolve falls back to the baked
+ * caption and a "0/0" value, so a wrong guess never breaks the menu. */
+#define CAT_COUNT 8
+#define ROW_COUNT 6
+
+static const char *const g_cat_syms[CAT_COUNT][ROW_COUNT] = {
+    /* 0: image quality (the original demo page) */
+    { "cmnViewSettingNodeRootRawFileType",
+      "cmnViewSettingNodeRootStlImageJPEGQuality",
+      "cmnViewSettingNodeRootStillImageSize",
+      "cmnViewSettingNodeRootStlImageAspectRatio",
+      "cmnViewSettingNodeRootStillPanoramaImageSize",
+      "cmnViewSettingNodeRootStlImageQuality" },
+    /* 1: common / power & display */
+    { "cmnViewSettingNodeRootAutoPowerOffTemp",
+      "cmnViewSettingNodeRootTouchOperation",
+      "cmnViewSettingNodeRootSetupCleaningMode",
+      "cmnViewSettingNodeRootSettingSetupNtscPalSEL",
+      "cmnViewSettingNodeRootAutoMonitorOff",
+      "cmnViewSettingNodeRootBeep" },
+    /* 2: shooting */
+    { "cmnViewSettingNodeRootSilentShutter",
+      "cmnViewSettingNodeRootSteadyShot",
+      "cmnViewSettingNodeRootZebra",
+      "cmnViewSettingNodeRootPeakingSettings",
+      "cmnViewSettingNodeRootCustomGridLine",
+      "cmnViewSettingNodeRootAudioMode" },
+    /* 3: playback */
+    { "cmnViewSettingNodeRootPlaybackDisplay",
+      "cmnViewSettingNodeRootGroupingDisplay",
+      "cmnViewSettingNodeRootMemoryCardDisplayCardSpace",
+      "cmnViewSettingNodeRootCopy",
+      "cmnViewSettingNodeRootAutoImageExtract",
+      "cmnViewSettingNodeRootWriteDate" },
+    /* 4: movie */
+    { "cmnViewSettingNodeRootMovieFileFormat",
+      "cmnViewSettingNodeRootMovieRecordingSetting",
+      "cmnViewSettingNodeRootMovieExpoMode",
+      "cmnViewSettingNodeRootMovieAudioRecord",
+      "cmnViewSettingNodeRootMovieSteadyShot",
+      "cmnViewSettingNodeRootFrameRateZako" },
+    /* 5: network */
+    { "cmnViewSettingNodeRootAccessPoint",
+      "cmnViewSettingNodeRootBluetoothSetting",
+      "cmnViewSettingNodeRootAirplaneMode",
+      "cmnViewSettingNodeRootWlPowerSave",
+      "cmnViewSettingNodeRootControlWithSmartPhone",
+      "cmnViewSettingNodeRootDisplayMACAddress" },
+    /* 6: setup / system */
+    { "cmnViewSettingNodeRootSetupVersion",
+      "cmnViewSettingNodeRootSetupLanguage",
+      "cmnViewSettingNodeRootClockDateTimeSetup",
+      "cmnViewSettingNodeRootMemoryCardFormat",
+      "cmnViewSettingNodeRootCopyrightInformation",
+      "cmnViewSettingNodeRootVersion" },
+    /* 7: custom */
+    { "cmnViewSettingNodeRootCustomFunction",
+      "cmnViewSettingNodeRootCustomButtonH",
+      "cmnViewSettingNodeRootCustomDialWheelSetup",
+      "cmnViewSettingNodeRootCustomFunctionShooting",
+      "cmnViewSettingNodeRootTouchPadSettings",
+      "cmnViewSettingNodeRootDISPButtonMonitor" },
 };
 
 static void *g_caution;
-static struct node *g_nodes[6];
+static struct node *g_nodes[CAT_COUNT][ROW_COUNT];
 static int g_nodes_tried;
 
 static void resolve_nodes(void)
 {
-    int i;
+    int c, i, found = 0;
     if (g_nodes_tried)
         return;
     g_nodes_tried = 1;
@@ -463,11 +449,46 @@ static void resolve_nodes(void)
     }
     g_caution = dlopen("/usr/lib/CautionConfig.so", 5 /* RTLD_LAZY|RTLD_NOLOAD */);
     log_hex("NM_caution=", (unsigned long)g_caution);
-    for (i = 0; i < 6; i++) {
-        g_nodes[i] = g_caution
-            ? (struct node *)dlsym(g_caution, g_row_syms[i]) : NULL;
+    for (c = 0; c < CAT_COUNT; c++) {
+        for (i = 0; i < ROW_COUNT; i++) {
+            g_nodes[c][i] = g_caution
+                ? (struct node *)dlsym(g_caution, g_cat_syms[c][i]) : NULL;
+            if (g_nodes[c][i])
+                found++;
+        }
     }
-    log_hex("NM_node0=", (unsigned long)g_nodes[0]);
+    log_hex("NM_nodes_found=", (unsigned long)found);
+    log_hex("NM_node0=", (unsigned long)g_nodes[0][0]);
+}
+
+static unsigned g_category;
+static unsigned g_selection;
+static int g_open;   /* 1 = overlay visible (toggled by tap / web) */
+static int g_dirty;  /* repaint on the next 20 ms beat */
+static int g_page;   /* 0 = setting list, 1 = option popup (2nd level) */
+
+/* After we hand the screen back, the native UI repaints its view.  Writing
+ * into its buffers during that repaint is what crashed the guest before, so
+ * stay quiet for a second. */
+static long g_pause_until;
+
+static void pause_paint(void)
+{
+    g_pause_until = mono_sec() + 1;
+}
+
+static int paint_paused(void)
+{
+    return g_pause_until && mono_sec() <= g_pause_until;
+}
+
+/* currently displayed row */
+static struct node *cur_node(unsigned row)
+{
+    unsigned c = g_category % CAT_COUNT;
+    if (row >= ROW_COUNT)
+        row = 0;
+    return g_nodes[c][row];
 }
 
 static void draw_number(int x, int y, unsigned value, unsigned total,
@@ -514,8 +535,6 @@ static const unsigned char g_rows[8][ROW_COUNT] = {
     { 6, 7, 8, 9, 10, 11 },
 };
 
-static unsigned g_category;
-static unsigned g_selection;
 static int g_rows_logged;
 
 /* defined below */
@@ -525,7 +544,8 @@ static int text_top(int x, int top, const char *s, uint16_t color);
 static int text_right(int right, int top, const char *s, uint16_t color);
 
 #define TITLE_MY_MENU "\xe6\x88\x91\xe7\x9a\x84" "\xe8\x8f\x9c\xe5\x8d\x95"
-#define FOOTER_CLOSE "MENU " "\xe5\x85\xb3\xe9\x97\xad"
+/* "\xe8\xbf\x94\xe5\x9b\x9e" = 返回: MENU is the back key */
+#define FOOTER_CLOSE "MENU " "\xe8\xbf\x94\xe5\x9b\x9e"
 
 /* log one UTF-8 string so the host can verify the resolved captions */
 static void log_utf8(const char *prefix, const char *s)
@@ -550,8 +570,10 @@ static void log_utf8(const char *prefix, const char *s)
  * committed by the firmware rather than poked into its state.
  */
 typedef int (*commit_fn)(void *self, int index);
+typedef int (*getint2_fn)(void *self, int a, int *out);
 static commit_fn g_commit_fn;
 static commit_fn g_commit_sr;
+static getint2_fn g_get_sr_idx;
 static int g_commit_tried;
 
 /* The parent's `selected` field holds the *SR number* of the current option,
@@ -570,23 +592,30 @@ static struct node *child_by_sr(const struct node *n, unsigned sr)
     return NULL;
 }
 
+static const char *popup_text_of(struct node *n, int idx);
+static void resolve_commit(void);
+
 static const char *value_current(const struct node *n)
 {
-    const struct node *c = NULL;
-    unsigned sel;
-    if (!n || !n->children || n->count <= 0)
+    struct node *m = (struct node *)n;
+    int i;
+
+    if (!m || !m->children || m->count <= 0)
         return NULL;
-    sel = (unsigned)n->selected;
-    /* options are addressed by SR (1..count); children[sel] is the common case,
-     * children[sel-1] the fallback for a 0-based table */
-    if (sel <= (unsigned)n->count && plausible(n->children[sel]))
-        c = (const struct node *)n->children[sel];
-    else if (sel > 0 && sel - 1u < (unsigned)n->count &&
-             plausible(n->children[sel - 1u]))
-        c = (const struct node *)n->children[sel - 1u];
-    if (!c)
-        return NULL;
-    return str_for_resid(node_title_resid(c));
+    /* `selected` holds the SR number; children[] is index based (option i+1
+     * lives at children[i]), so the SR has to be mapped back to the index the
+     * same way the firmware does it */
+    resolve_commit();
+    if (g_get_sr_idx) {
+        for (i = 1; i <= m->count; i++) {
+            int sr = -1;
+            if (g_get_sr_idx(m, i, &sr) == 1 && sr == m->selected)
+                return popup_text_of(m, i);
+        }
+    }
+    if (m->selected >= 1 && m->selected <= m->count)
+        return popup_text_of(m, m->selected);
+    return NULL;
 }
 
 static const char *value_of(const struct node *n, unsigned idx)
@@ -609,15 +638,18 @@ static void resolve_commit(void)
             g_caution, "_ZN18CmnViewSettingNode22setItemSelectedByIndexEi");
         g_commit_sr = (commit_fn)dlsym(
             g_caution, "_ZN18CmnViewSettingNode22setItemSelectedBySRNumEi");
+        g_get_sr_idx = (getint2_fn)dlsym(
+            g_caution, "_ZN18CmnViewSettingNode15getSRNumByIndexEiRi");
     }
     log_hex("NM_commit=", (unsigned long)g_commit_fn);
     log_hex("NM_commit_sr=", (unsigned long)g_commit_sr);
+    log_hex("NM_getsr=", (unsigned long)g_get_sr_idx);
 }
 
 static void commit_step(int dir)
 {
-    struct node *n = g_nodes[g_selection < ROW_COUNT ? g_selection : 0];
-    unsigned cnt, i, cur, target, new_sr;
+    struct node *n = cur_node(g_selection);
+    unsigned cnt, i, cur;
     const char *before, *after;
 
     if (!n || n->count <= 0 || !n->children) {
@@ -631,35 +663,351 @@ static void commit_step(int dir)
     }
     cnt = (unsigned)n->count;
     cur = (unsigned)n->selected;
-    /* locate the option that currently owns the selected SR number */
-    target = cnt;
-    for (i = 0; i < cnt; i++) {
-        struct node *c = plausible(n->children[i])
-            ? (struct node *)n->children[i] : NULL;
-        if (c && c->state == cur) {
-            target = (dir > 0) ? (i + 1u) % cnt : (i + cnt - 1u) % cnt;
+    /* SR numbers are 1..count and are only obtainable through the firmware's
+     * own getter (the child's `state` field is NOT the SR number). */
+    {
+        int cur_idx = -1;
+        int new_sr = -1;
+        int tgt;
+        if (!g_get_sr_idx) {
+            out("NM_COMMIT noget\n", 17);
+            return;
+        }
+        for (i = 1; i <= cnt; i++) {
+            int sr = -1;
+            if (g_get_sr_idx(n, (int)i, &sr) == 1 && sr == (int)cur) {
+                cur_idx = (int)i;
+                break;
+            }
+        }
+        if (cur_idx < 0) {
+            out("NM_COMMIT nosr\n", 15);
+            return;
+        }
+        tgt = cur_idx + dir;
+        if (tgt < 1)
+            tgt = (int)cnt;
+        if (tgt > (int)cnt)
+            tgt = 1;
+        if (g_get_sr_idx(n, tgt, &new_sr) != 1 || new_sr < 0) {
+            out("NM_COMMIT nosr2\n", 16);
+            return;
+        }
+        before = value_current(n);
+        g_commit_sr(n, new_sr);
+        after = value_current(n);
+        log_hex("NM_COMMIT row=", (unsigned long)g_selection);
+        log_hex("NM_from=", (unsigned long)cur);
+        log_hex("NM_to=", (unsigned long)new_sr);
+    log_hex("NM_selected=", (unsigned long)n->selected);
+        log_utf8("NM_BEFORE ", before ? before : "?");
+        log_utf8("NM_AFTER ", after ? after : "?");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* second level: option popup                                          */
+/*                                                                     */
+/* Tapping the already selected row opens this page.  It lists every   */
+/* option of the row (SR numbers resolved through the firmware's own   */
+/* getter), marks the current one, and applying an entry calls          */
+/* setItemSelectedBySRNum -- the same call the native menu makes.       */
+/* ------------------------------------------------------------------ */
+
+#define POPUP_X 70
+#define POPUP_Y 80
+#define POPUP_W 500
+#define POPUP_TITLE_H 46
+#define POPUP_OPT_H 40
+#define POPUP_OPTS 7
+#define POPUP_MORE_H 26
+#define POPUP_H (POPUP_TITLE_H + POPUP_OPTS * POPUP_OPT_H + POPUP_MORE_H + 8)
+
+static int g_opt_first;             /* 1-based index of the first entry */
+static int g_opt_hover;             /* 1-based index highlighted by keys */
+static unsigned g_opt_total;        /* number of options in the row */
+static int g_opt_sr[POPUP_OPTS];
+static const char *g_opt_text[POPUP_OPTS];
+
+static int popup_sr_of(struct node *n, int idx)
+{
+    int sr = -1;
+    if (!n || idx < 1)
+        return -1;
+    resolve_commit();
+    if (g_get_sr_idx && g_get_sr_idx(n, idx, &sr) == 1 && sr > 0)
+        return sr;
+    return idx;
+}
+
+/* children[] is index based (children[i] belongs to option i+1) */
+static const char *popup_text_of(struct node *n, int idx)
+{
+    struct node *c;
+    if (!n || !n->children || idx < 1 || idx > n->count)
+        return NULL;
+    c = plausible(n->children[idx - 1])
+        ? (struct node *)n->children[idx - 1] : NULL;
+    return c ? str_for_resid(node_title_resid(c)) : NULL;
+}
+
+static void popup_fill(void)
+{
+    struct node *n = cur_node(g_selection);
+    int i;
+
+    for (i = 0; i < POPUP_OPTS; i++) {
+        int idx = g_opt_first + i;
+        int sr = 0;
+        const char *t = NULL;
+        if (idx <= (int)g_opt_total) {
+            sr = popup_sr_of(n, idx);
+            t = popup_text_of(n, idx);
+        }
+        g_opt_sr[i] = (idx <= (int)g_opt_total) ? sr : 0;
+        g_opt_text[i] = t;
+    }
+}
+
+static void popup_open(void)
+{
+    struct node *n = cur_node(g_selection);
+    int i, cur_idx = -1, sr;
+
+    g_page = 1;
+    g_dirty = 1;
+    g_opt_total = n ? (unsigned)n->count : 0;
+    if (!n || n->count <= 0) {
+        g_opt_total = 0;
+        g_opt_first = 1;
+        g_opt_hover = 1;
+        popup_fill();
+        out("NM_POPUP empty\n", 15);
+        return;
+    }
+    for (i = 1; i <= (int)g_opt_total; i++) {
+        sr = popup_sr_of(n, i);
+        if (sr >= 0 && sr == n->selected) {
+            cur_idx = i;
             break;
         }
     }
-    if (target >= cnt) {
-        out("NM_COMMIT nosr\n", 15);
-        return;
-    }
-    {
-        struct node *tc = (struct node *)n->children[target];
-        new_sr = tc ? (unsigned)tc->state : 0;
-    }
-    before = value_current(n);
-    g_commit_sr(n, (int)new_sr);
-    after = value_current(n);
-    log_hex("NM_COMMIT row=", (unsigned long)g_selection);
-    log_hex("NM_from=", (unsigned long)cur);
-    log_hex("NM_to=", (unsigned long)new_sr);
-    log_hex("NM_selected=", (unsigned long)n->selected);
-    log_utf8("NM_BEFORE ", before ? before : "?");
-    log_utf8("NM_AFTER ", after ? after : "?");
+    if (cur_idx < 0)
+        cur_idx = 1;
+    g_opt_first = ((cur_idx - 1) / POPUP_OPTS) * POPUP_OPTS + 1;
+    g_opt_hover = cur_idx;
+    popup_fill();
+    log_hex("NM_POPUP open total=", (unsigned long)g_opt_total);
+    log_hex("NM_POPUP cur=", (unsigned long)cur_idx);
+    log_utf8("NM_POPUP title ",
+             str_for_resid(node_title_resid(n)) ?
+             str_for_resid(node_title_resid(n)) : "?");
 }
 
+static void popup_move(int dir)
+{
+    int last_page, page, i;
+
+    if (g_opt_total <= POPUP_OPTS) {
+        /* straight navigation inside the single page */
+        g_opt_hover += dir;
+        if (g_opt_hover < 1)
+            g_opt_hover = 1;
+        if (g_opt_hover > (int)g_opt_total)
+            g_opt_hover = (int)g_opt_total;
+        g_dirty = 1;
+        return;
+    }
+    last_page = ((int)g_opt_total - 1) / POPUP_OPTS;
+    page = (g_opt_hover - 1) / POPUP_OPTS;
+    i = (g_opt_hover - 1) % POPUP_OPTS;
+    i += dir;
+    if (i < 0) {
+        if (page > 0) {
+            page--;
+            i = POPUP_OPTS - 1;
+        } else {
+            i = 0;
+        }
+    } else if (i >= POPUP_OPTS || g_opt_hover + dir > (int)g_opt_total) {
+        if (page < last_page && g_opt_hover + dir <= (int)g_opt_total) {
+            page++;
+            i = 0;
+        } else {
+            i = (int)g_opt_total - page * POPUP_OPTS - 1;
+            if (i > POPUP_OPTS - 1)
+                i = POPUP_OPTS - 1;
+        }
+    }
+    g_opt_hover = page * POPUP_OPTS + i + 1;
+    g_opt_first = page * POPUP_OPTS + 1;
+    popup_fill();
+    g_dirty = 1;
+    log_hex("NM_POPUP hover=", (unsigned long)g_opt_hover);
+}
+
+static void popup_page(int dir)
+{
+    int last_first;
+
+    if (g_opt_total <= POPUP_OPTS)
+        return;
+    last_first = (((int)g_opt_total - 1) / POPUP_OPTS) * POPUP_OPTS + 1;
+    g_opt_first += dir * POPUP_OPTS;
+    if (g_opt_first < 1)
+        g_opt_first = 1;
+    if (g_opt_first > last_first)
+        g_opt_first = last_first;
+    if (g_opt_hover < g_opt_first)
+        g_opt_hover = g_opt_first;
+    if (g_opt_hover > g_opt_first + POPUP_OPTS - 1)
+        g_opt_hover = g_opt_first + POPUP_OPTS - 1;
+    if (g_opt_hover > (int)g_opt_total)
+        g_opt_hover = (int)g_opt_total;
+    popup_fill();
+    g_dirty = 1;
+    log_hex("NM_POPUP page=", (unsigned long)g_opt_first);
+}
+
+static void popup_apply(int idx)
+{
+    struct node *n = cur_node(g_selection);
+    int sr, i;
+
+    if (!n || idx < 1 || idx > (int)g_opt_total) {
+        out("NM_POPUP badidx\n", 15);
+        return;
+    }
+    sr = popup_sr_of(n, idx);
+    resolve_commit();
+    if (!g_commit_sr || sr <= 0) {
+        out("NM_POPUP noapi\n", 15);
+        return;
+    }
+    g_commit_sr(n, sr);
+    log_hex("NM_POPUP apply idx=", (unsigned long)idx);
+    log_hex("NM_POPUP sr=", (unsigned long)sr);
+    log_hex("NM_POPUP selected=", (unsigned long)n->selected);
+    log_utf8("NM_POPUP value ",
+             value_current(n) ? value_current(n) : "?");
+    /* refresh the list row behind the popup, then go back to it */
+    for (i = 0; i < POPUP_OPTS; i++)
+        g_opt_sr[i] = 0;
+    g_page = 0;
+    g_dirty = 1;
+}
+
+/* cheap 50% dim outside the popup (no divisions: one shift per channel) */
+static void dim_out(struct box box)
+{
+    struct box parts[4];
+    int i;
+
+    parts[0] = (struct box){ 0, 0, MENU_W, box.y };
+    parts[1] = (struct box){ 0, box.y + box.h, MENU_W,
+                             MENU_H - (box.y + box.h) };
+    parts[2] = (struct box){ 0, box.y, box.x, box.h };
+    parts[3] = (struct box){ box.x + box.w, box.y,
+                             MENU_W - (box.x + box.w), box.h };
+    for (i = 0; i < 4; i++) {
+        struct box b = clip(parts[i]);
+        int x, y;
+        for (y = b.y; y < b.y + b.h; y++) {
+            u16 *row = &g_lin[y * MENU_W];
+            for (x = b.x; x < b.x + b.w; x++)
+                row[x] = (u16)(((row[x] >> 1) & 0x7777u) | 0x000fu);
+        }
+    }
+}
+
+static void popup_draw(void)
+{
+    struct node *n = cur_node(g_selection);
+    int rows = (int)g_opt_total - g_opt_first + 1;
+    struct box box;
+    const char *title = n ? str_for_resid(node_title_resid(n)) : NULL;
+    int i;
+
+    if (rows < 1)
+        rows = 1;
+    if (rows > POPUP_OPTS)
+        rows = POPUP_OPTS;
+    box = (struct box){ POPUP_X, POPUP_Y, POPUP_W,
+                        POPUP_TITLE_H + rows * POPUP_OPT_H +
+                        (g_opt_total > (unsigned)POPUP_OPTS ? POPUP_MORE_H : 0) + 8 };
+    dim_out(box);
+
+    rect(box, 0x1112);
+    rect((struct box){ box.x, box.y, box.w, 2 }, 0x666f);
+    rect((struct box){ box.x, box.y + box.h - 2, box.w, 2 }, 0x666f);
+    rect((struct box){ box.x, box.y, 2, box.h }, 0x666f);
+    rect((struct box){ box.x + box.w - 2, box.y, 2, box.h }, 0x666f);
+    rect((struct box){ box.x + 2, box.y + POPUP_TITLE_H - 1, box.w - 4, 1 }, 0x333f);
+
+    if (title)
+        text_top(box.x + 18, box.y + 10, title, 0xffff);
+    if (g_opt_total > POPUP_OPTS)
+        draw_number(box.x + box.w - 74, box.y + 10,
+                    (unsigned)((g_opt_first - 1) / POPUP_OPTS + 1),
+                    (unsigned)((g_opt_total + POPUP_OPTS - 1) / POPUP_OPTS),
+                    0x889f);
+
+    if (g_opt_total == 0) {
+        text_top(box.x + 18, box.y + POPUP_TITLE_H + 8,
+                 "\xe6\x97\xa0\xe5\x8f\xaf\xe7\x94\xa8"
+                 "\xe9\x80\x89\xe9\xa1\xb9", 0x889f);
+        return;
+    }
+    for (i = 0; i < POPUP_OPTS; i++) {
+        int idx = g_opt_first + i;
+        int y = box.y + POPUP_TITLE_H + i * POPUP_OPT_H;
+        int cur, hov;
+        uint16_t fg = 0xdddf;
+        if (idx > (int)g_opt_total || g_opt_sr[i] <= 0)
+            continue;
+        cur = (n && (int)n->selected == g_opt_sr[i]);
+        hov = (idx == g_opt_hover);
+        rect((struct box){ box.x + 10, y, box.w - 20, POPUP_OPT_H - 2 },
+             hov ? 0xd520 : (cur ? 0x0a4e : 0x000f));
+        /* radio mark: hollow square, filled when it is the current value */
+        rect((struct box){ box.x + 22, y + 12, 14, 2 }, 0x889f);
+        rect((struct box){ box.x + 22, y + 24, 14, 2 }, 0x889f);
+        rect((struct box){ box.x + 22, y + 12, 2, 14 }, 0x889f);
+        rect((struct box){ box.x + 34, y + 12, 2, 14 }, 0x889f);
+        if (cur) {
+            rect((struct box){ box.x + 26, y + 16, 6, 6 }, 0xffff);
+            fg = 0xffff;
+        }
+        if (g_opt_text[i])
+            text_top(box.x + 48, y + 8, g_opt_text[i], fg);
+        else
+            draw_number(box.x + 48, y + 8, (unsigned)idx, 0, fg);
+    }
+    if (g_opt_total > POPUP_OPTS) {
+        int y = box.y + POPUP_TITLE_H + rows * POPUP_OPT_H + 2;
+        /* "下一页" -- the strip always pages forward and wraps to page 1 */
+        text_top(box.x + 18, y,
+                 "\xe4\xb8\x8b\xe4\xb8\x80\xe9\xa1\xb5", 0x889f);
+    }
+}
+
+/* one step back: popup -> list -> native menu (restores the native frame) */
+static void overlay_close(int restore);
+static void overlay_open(void);
+
+static void nm_back(void)
+{
+    if (!g_open)
+        return;
+    if (g_page) {
+        g_page = 0;
+        out("NM_BACK popup\n", 14);
+    } else {
+        overlay_close(1);
+        out("NM_BACK close\n", 14);
+    }
+    g_dirty = 1;
+}
 static void build_frame(void)
 {
     struct box frame = { 0, 0, MENU_W, MENU_H };
@@ -678,7 +1026,7 @@ static void build_frame(void)
     /* header title + page counter */
     rect((struct box){ 0, 56, MENU_W, 44 }, 0x111f);
     text_top(20, 64, TITLE_MY_MENU, 0xdddf);
-    text_at(MENU_W - 96, 62, &a7_page_text, 0xdddf);
+    draw_number(MENU_W - 76, 62, g_category + 1u, CAT_COUNT, 0xdddf);
 
     /* rows */
     for (i = 0; i < ROW_COUNT; i++) {
@@ -690,12 +1038,14 @@ static void build_frame(void)
 
         rect(row, selected ? 0xd520 : 0x111f);
 
-        if (g_nodes[i]) {
-            title = str_for_resid(node_title_resid(g_nodes[i]));
-            cnt = (unsigned)g_nodes[i]->count;
-            value = value_current(g_nodes[i]);
-            if (cnt > 0) {
-                sel = (unsigned)g_nodes[i]->selected;
+        {
+            struct node *nd = cur_node((unsigned)i);
+            if (nd) {
+                title = str_for_resid(node_title_resid(nd));
+                cnt = (unsigned)nd->count;
+                value = value_current(nd);
+                if (cnt > 0)
+                    sel = (unsigned)nd->selected;
             }
         }
 
@@ -705,12 +1055,21 @@ static void build_frame(void)
             label(24, row.y + 12, &ov_labels[g_rows[g_category & 7u][i]], color);
 
         if (value) {
-            text_right(MENU_W - 24, row.y + 12, value, color);
-        } else if (g_nodes[i] && cnt > 0) {
-            draw_number(MENU_W - 150, row.y + 12, sel + 1u, cnt, color);
+            text_right(MENU_W - 48, row.y + 12, value, color);
+        } else if (cnt > 0) {
+            draw_number(MENU_W - 170, row.y + 12, sel + 1u, cnt, color);
         } else {
-            draw_number(MENU_W - 150, row.y + 12, 0u, 0u,
+            draw_number(MENU_W - 170, row.y + 12, 0u, 0u,
                         selected ? 0xffff : 0x88af);
+        }
+        /* ">": this row opens a second level */
+        if (cnt > 0) {
+            int cx = MENU_W - 30, cy = row.y + 26;
+            int k;
+            for (k = 0; k < 7; k++) {
+                rect((struct box){ cx + k, cy - 8 + k, 2, 2 }, color);
+                rect((struct box){ cx + k, cy + 8 - k, 2, 2 }, color);
+            }
         }
 
         if (log_rows && i < 6) {
@@ -721,8 +1080,11 @@ static void build_frame(void)
     }
     g_rows_logged = 1;
 
-    /* footer */
+    /* footer + the old/new switch button in the top-right corner */
     text_top(MENU_W - 190, MENU_H - 40, FOOTER_CLOSE, 0xdddf);
+    draw_switch_icon(SW_BTN_X, SW_BTN_Y, 1);
+    if (g_page)
+        popup_draw();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1049,8 +1411,12 @@ static int put_flip(void)
         rc = -1;
     if (put_panel_at(0x23B16000UL, 0) != 0)
         rc = -1;
-    if (rc == 0)
-        out("NM_FLIP\n", 8);
+    if (rc == 0) {
+        /* keep the guest log small: /tmp is a 12 MB vfat partition */
+        static unsigned flip_logs;
+        if ((flip_logs++ % 20u) == 0)
+            out("NM_FLIP\n", 8);
+    }
     return rc;
 }
 
@@ -1059,6 +1425,98 @@ static long g_first_paint;
 static volatile int g_busy_ticks;
 static volatile int g_present_ready;
 
+/* --- taking the screen and handing it back --------------------------
+ *
+ * The native app only redraws when *it* has something new, so simply
+ * stopping our writes would leave our menu on the glass forever.  Instead the
+ * native frame is captured the moment the overlay opens and written back
+ * (with the corner button) when the user switches back by hand.
+ * ------------------------------------------------------------------ */
+
+#define RENDER_PA 0x202E0200UL
+
+static u16 g_native_bg[MENU_W * MENU_H];
+static int g_saved_ok;
+
+static int panel_grab(void)
+{
+    const unsigned long base = RENDER_PA & ~0xfffUL;
+    const unsigned long off = RENDER_PA & 0xfffUL;
+    long m;
+    int fd;
+    const u16 *fb;
+    unsigned x, y;
+
+    fd = (int)sys3(SYS_open, (long)"/dev/mem", 0, 0);
+    if (fd < 0)
+        return -1;
+    m = sys4(SYS_mmap2, 0, 0x98000, 1, 1, fd, (long)(base >> 12));
+    if (m < 0 && m > -4096) {
+        sys2(SYS_close, fd, 0);
+        return -2;
+    }
+    fb = (const u16 *)(m + off);
+    for (y = 0; y < MENU_H; y++) {
+        unsigned yy = MENU_H - 1u - y;
+        unsigned rowbase = (yy >> 3) * 80u;
+        for (x = 0; x < MENU_W; x++) {
+            unsigned z = (x & 1u) | ((yy & 1u) << 1) | ((x & 2u) << 1) |
+                         ((yy & 2u) << 2) | ((x & 4u) << 2) |
+                         ((yy & 4u) << 3);
+            g_native_bg[y * MENU_W + x] =
+                fb[(rowbase + (x >> 3)) * 64u + z];
+        }
+    }
+    sys3(SYS_munmap, m, 0x98000, 0);
+    sys2(SYS_close, fd, 0);
+    g_saved_ok = 1;
+    out("NM_GRAB\n", 8);
+    return 0;
+}
+
+static void panel_restore(void)
+{
+    unsigned i;
+
+    if (!g_saved_ok)
+        return;
+    for (i = 0; i < (unsigned)(MENU_W * MENU_H); i++)
+        g_lin[i] = g_native_bg[i];
+    draw_switch_icon(SW_BTN_X, SW_BTN_Y, 0);
+    put_panel_at(RENDER_PA, 0);
+    put_flip();
+    g_saved_ok = 0;
+    out("NM_RESTORE\n", 11);
+}
+
+static void overlay_open(void)
+{
+    if (g_open)
+        return;
+    if (g_saved_ok)
+        g_saved_ok = 0;
+    panel_grab();
+    g_open = 1;
+    g_selection = 0;
+    g_page = 0;
+    g_dirty = 1;
+    out("NM_OPEN\n", 8);
+}
+
+static void overlay_close(int restore)
+{
+    if (!g_open) {
+        g_page = 0;
+        return;
+    }
+    g_open = 0;
+    g_page = 0;
+    g_dirty = 1;
+    if (restore)
+        panel_restore();
+    pause_paint();
+}
+
 /* Prototype input channel: the serial shell writes one character into
  * /setting/nm_key ('u'/'d'/'c'); we consume and unlink it.  Hooking the real
  * input path is the next step, but this keeps the demo controllable without
@@ -1066,7 +1524,7 @@ static volatile int g_present_ready;
 /* dump the option list of the selected row: index, caption, per-node flags */
 static void list_children(void)
 {
-    struct node *n = g_nodes[g_selection < ROW_COUNT ? g_selection : 0];
+    struct node *n = cur_node(g_selection);
     unsigned i;
 
     if (!n || !n->children) {
@@ -1141,6 +1599,7 @@ static int g_settle_done;
 static int g_tap_stage;
 static unsigned g_tap_next;
 static unsigned g_tap_ms;
+static unsigned g_last_tap_ms;   /* same, for the "native presented" heuristic */
 
 static void handle_touch(int x, int y)
 {
@@ -1150,21 +1609,77 @@ static void handle_touch(int x, int y)
     log_hex("NM_TOUCH y=", (unsigned long)y);
     if (x < 0 || y < 0 || x >= MENU_W || y >= MENU_H)
         return;
+    g_last_tap_ms = now_ms();
+
+    /* the switch button sits in the top-right corner in both states */
+    if (x >= SW_TAP_X && y <= SW_TAP_Y) {
+        if (g_open)
+            overlay_close(1);
+        else
+            overlay_open();
+        log_hex("NM_SWITCH open=", (unsigned long)g_open);
+        return;
+    }
+
+    if (!g_open) {
+        /* anything else on the native screen belongs to the native UI */
+        return;
+    }
+    if (g_page) {                        /* option popup is modal */
+        struct box box;
+        int rows = (int)g_opt_total - g_opt_first + 1;
+        if (rows < 1)
+            rows = 1;
+        if (rows > POPUP_OPTS)
+            rows = POPUP_OPTS;
+        box = (struct box){ POPUP_X, POPUP_Y, POPUP_W,
+                            POPUP_TITLE_H + rows * POPUP_OPT_H +
+                            (g_opt_total > (unsigned)POPUP_OPTS ?
+                             POPUP_MORE_H : 0) + 8 };
+        if (x < box.x || x >= box.x + box.w ||
+            y < box.y || y >= box.y + box.h) {
+            nm_back();                   /* tap outside = back */
+            return;
+        }
+        row = (y - box.y - POPUP_TITLE_H) / POPUP_OPT_H;
+        if (row >= 0 && row < POPUP_OPTS) {
+            int idx = g_opt_first + row;
+            if (idx <= (int)g_opt_total && g_opt_sr[row] > 0) {
+                log_hex("NM_POPUP tap=", (unsigned long)idx);
+                popup_apply(idx);
+                return;
+            }
+        }
+        /* "更多" strip at the bottom pages forward (wraps to page 1) */
+        if (g_opt_total > (unsigned)POPUP_OPTS &&
+            y >= box.y + POPUP_TITLE_H + rows * POPUP_OPT_H) {
+            popup_page(g_opt_first + POPUP_OPTS > (int)g_opt_total ? -99 : 1);
+            log_hex("NM_POPUP page=", (unsigned long)g_opt_first);
+        }
+        return;
+    }
+    if (y >= 434) {                     /* footer: back to the native menu */
+        nm_back();
+        return;
+    }
     if (y < 56) {                       /* category strip */
         row = x / 58;
         if (row >= 0 && row < 8) {
             g_category = (unsigned)row;
+            g_dirty = 1;
             log_hex("NM_TAP cat=", (unsigned long)row);
         }
         return;
     }
     if (y >= ROW_Y0 && y < ROW_Y0 + ROW_COUNT * ROW_H) {
         row = (y - ROW_Y0) / ROW_H;
-        if (row == (int)g_selection && now_ms() - g_tap_ms < TOUCH_TAP_MS) {
+        if (row == (int)g_selection) {
+            /* second tap on the selected row opens its second-level page */
             log_hex("NM_TAP2 row=", (unsigned long)row);
-            commit_step(1);             /* second tap on the row = apply */
+            popup_open();
         } else {
             g_selection = (unsigned)row;
+            g_dirty = 1;
         }
         g_tap_ms = now_ms();
         log_hex("NM_TAP row=", (unsigned long)row);
@@ -1213,7 +1728,7 @@ typedef void (*sel_void_fn)(void *self);
 
 static void dump_row(const char *tag)
 {
-    struct node *n = g_nodes[g_selection < ROW_COUNT ? g_selection : 0];
+    struct node *n = cur_node(g_selection);
     unsigned i;
     log_utf8("NM_TEST_TAG ", tag);
     if (!n)
@@ -1234,7 +1749,7 @@ static void dump_row(const char *tag)
 
 static void dump_props(const char *tag)
 {
-    struct node *n = g_nodes[g_selection < ROW_COUNT ? g_selection : 0];
+    struct node *n = cur_node(g_selection);
     const struct props *pr;
     int i;
 
@@ -1280,7 +1795,7 @@ typedef int (*getint1_fn)(void *self, int a);
  * meaning of `selected` / child `state` is established rather than guessed. */
 static void sr_report(const char *tag)
 {
-    struct node *n = g_nodes[g_selection < ROW_COUNT ? g_selection : 0];
+    struct node *n = cur_node(g_selection);
     getint_fn f_srsel;
     getint2_fn f_sridx, f_state;
     getint1_fn f_issel;
@@ -1343,7 +1858,7 @@ static void self_test(void)
         return;
     }
     for (row = 0; row < ROW_COUNT; row++) {
-        struct node *n = g_nodes[row];
+        struct node *n = cur_node(row);
         int srs[8], k = 0, i;
         if (!n || !n->children || n->count <= 0)
             continue;
@@ -1385,7 +1900,7 @@ static void settle_report(void)
 
     out("NM_SETTLE begin\n", 16);
     for (r = 0; r < ROW_COUNT; r++) {
-        struct node *n = g_nodes[r];
+        struct node *n = cur_node(r);
         log_hex("NM_SETTLE row=", (unsigned long)r);
         if (n) {
             log_hex("NM_SETTLE sel=", (unsigned long)n->selected);
@@ -1453,40 +1968,262 @@ static int flip_guard(void)
     b = g_flip_vb[0] | ((unsigned)g_flip_vb[1] << 16);
     if (a == g_flip_canary[0] && b == g_flip_canary[1])
         return 0;
+    /* The app only presents when *it* has something new to show.  While the
+     * overlay owns the screen and nothing we just did explains a present, that
+     * present means a native key was pressed -> act as "back". */
+    if (g_open && (now_ms() - g_last_tap_ms) > 1500u) {
+        if (g_page) {
+            g_page = 0;
+            g_last_tap_ms = now_ms();        /* absorb the follow-up frames */
+            out("NM_NATIVE_BACK page\n", 21);
+            g_dirty = 1;
+        } else {
+            overlay_close(0);              /* the app repaints itself */
+            out("NM_NATIVE_BACK close\n", 22);
+        }
+        return 1;
+    }
     out("NM_REPRESENT\n", 13);
     put_flip();
     flip_note();
     return 1;
 }
 
+/* --- switch button while the native menu is on screen ----------------
+ *
+ * The native UI keeps presenting its own frames, so the only place the
+ * button can survive is the presented buffer itself.  It is a 44x44 patch
+ * written straight into both flip buffers on every 20 ms beat; a present
+ * can wipe it, the next beat puts it back (same mechanism as the present
+ * guard for the full overlay).
+ * ------------------------------------------------------------------ */
+
+#define BADGE_W SW_BTN
+#define BADGE_H SW_BTN
+static u16 g_badge[BADGE_W * BADGE_H];
+static int g_badge_ready;
+static int g_badge_logged;
+
+static void badge_make(void)
+{
+    int x, y;
+    if (g_badge_ready)
+        return;
+    g_badge_ready = 1;
+    for (y = 0; y < BADGE_H; y++)
+        for (x = 0; x < BADGE_W; x++)
+            g_lin[y * MENU_W + x] = 0x000f;
+    draw_switch_icon(0, 0, 0);
+    for (y = 0; y < BADGE_H; y++)
+        for (x = 0; x < BADGE_W; x++)
+            g_badge[y * BADGE_W + x] = g_lin[y * MENU_W + x];
+}
+
+/* Morton 8x8 tiled + row flipped layout, one rectangle only */
+static void flip_put_rect(u16 *dst, int x0, int y0, int w, int h, const u16 *src)
+{
+    int x, y;
+    for (y = 0; y < h; y++) {
+        unsigned yy = MENU_H - 1u - (unsigned)(y0 + y);
+        unsigned rowbase = (yy >> 3) * 80u;
+        for (x = 0; x < w; x++) {
+            unsigned xx = (unsigned)(x0 + x);
+            unsigned z = (xx & 1u) | ((yy & 1u) << 1) | ((xx & 2u) << 1) |
+                         ((yy & 2u) << 2) | ((xx & 4u) << 2) |
+                         ((yy & 4u) << 3);
+            dst[(rowbase + (xx >> 3)) * 64u + z] = src[y * w + x];
+        }
+    }
+}
+
+static int badge_enabled(void)
+{
+    return !file_exists("/setting/nm_nobadge");
+}
+
+/* Write (or refresh) the switch button into one 640x480 RGBA4444 surface,
+ * Morton tiled and row flipped, touching only the button's pixels.  `verify`
+ * skips the write when the region already holds the button, so a surface the
+ * app repaints is only poked once per repaint instead of on every tick. */
+static int panel_put_badge(unsigned long pa, int verify)
+{
+    const unsigned long base = pa & ~0xfffUL;
+    const unsigned long off = pa & 0xfffUL;
+    long m;
+    int fd;
+    u16 *fb;
+    int x, y, differs = 0;
+
+    fd = (int)sys3(SYS_open, (long)"/dev/mem", 2, 0);
+    if (fd < 0)
+        return -1;
+    m = sys4(SYS_mmap2, 0, 0x98000, 3, 1, fd, (long)(base >> 12));
+    if (m < 0 && m > -4096) {
+        sys2(SYS_close, fd, 0);
+        return -2;
+    }
+    fb = (u16 *)(m + off);
+    if (verify) {
+        for (y = 0; y < BADGE_H && !differs; y++) {
+            unsigned yy = MENU_H - 1u - (unsigned)(SW_BTN_Y + y);
+            unsigned rowbase = (yy >> 3) * 80u;
+            for (x = 0; x < BADGE_W; x++) {
+                unsigned xx = (unsigned)(SW_BTN_X + x);
+                unsigned z = (xx & 1u) | ((yy & 1u) << 1) |
+                             ((xx & 2u) << 1) | ((yy & 2u) << 2) |
+                             ((xx & 4u) << 2) | ((yy & 4u) << 3);
+                if (fb[(rowbase + (xx >> 3)) * 64u + z] !=
+                    g_badge[y * BADGE_W + x]) {
+                    differs = 1;
+                    break;
+                }
+            }
+        }
+        if (!differs) {
+            sys3(SYS_munmap, m, 0x98000, 0);
+            sys2(SYS_close, fd, 0);
+            return 1;
+        }
+    }
+    for (y = 0; y < BADGE_H; y++) {
+        unsigned yy = MENU_H - 1u - (unsigned)(SW_BTN_Y + y);
+        unsigned rowbase = (yy >> 3) * 80u;
+        for (x = 0; x < BADGE_W; x++) {
+            unsigned xx = (unsigned)(SW_BTN_X + x);
+            unsigned z = (xx & 1u) | ((yy & 1u) << 1) | ((xx & 2u) << 1) |
+                         ((yy & 2u) << 2) | ((xx & 4u) << 2) |
+                         ((yy & 4u) << 3);
+            fb[(rowbase + (xx >> 3)) * 64u + z] = g_badge[y * BADGE_W + x];
+        }
+    }
+    sys3(SYS_munmap, m, 0x98000, 0);
+    sys2(SYS_close, fd, 0);
+    return 0;
+}
+
+static void badge_tick(void)
+{
+    if (paint_paused())
+        return;
+    if (!badge_enabled())
+        return;
+    badge_make();
+    /* the panel scans out the render target (0x202E0200): gate the write on
+     * "the app has drawn over it", so a repaint is never raced */
+    panel_put_badge(0x202E0200UL, 1);
+    if (g_flip_ok) {
+        flip_put_rect(g_flip_va, SW_BTN_X, SW_BTN_Y, BADGE_W, BADGE_H, g_badge);
+        flip_put_rect(g_flip_vb, SW_BTN_X, SW_BTN_Y, BADGE_W, BADGE_H, g_badge);
+    }
+    if (!g_badge_logged) {
+        g_badge_logged = 1;
+        out("NM_BADGE on\n", 13);
+    }
+}
+
+/* synthetic touch injection for testing without a panel:
+ * the host writes "x y" into /tmp/nm_touch and then the key 'T' */
+static int parse_int(const char **p)
+{
+    int v = 0, s = 1;
+    while (**p && (**p < '0' || **p > '9') && **p != '-')
+        (*p)++;
+    if (**p == '-') {
+        s = -1;
+        (*p)++;
+    }
+    while (**p >= '0' && **p <= '9') {
+        v = v * 10 + (**p - '0');
+        (*p)++;
+    }
+    return v * s;
+}
+
+static void touch_from_file(void)
+{
+    char buf[40];
+    const char *p = buf;
+    int fd, n, x, y;
+
+    fd = (int)sys3(SYS_open, (long)"/tmp/nm_touch", 0, 0);
+    if (fd < 0) {
+        out("NM_TF nofd\n", 11);
+        return;
+    }
+    n = (int)sys3(SYS_read, fd, (long)buf, 39);
+    sys2(SYS_close, fd, 0);
+    sys3(SYS_unlink, (long)"/tmp/nm_touch", 0, 0);
+    if (n <= 0)
+        return;
+    buf[n < 39 ? n : 39] = 0;
+    x = parse_int(&p);
+    y = parse_int(&p);
+    log_hex("NM_TF x=", (unsigned long)x);
+    log_hex("NM_TF y=", (unsigned long)y);
+    handle_touch(x, y);
+}
+
 static void poll_key(void)
 {
     char buf[8];
-    int fd = (int)sys3(SYS_open, (long)"/setting/nm_key", 0, 0);
+    int fd = (int)sys3(SYS_open, (long)"/tmp/nm_key", 0, 0);
     int n;
     if (fd < 0)
         return;
     n = (int)sys3(SYS_read, fd, (long)buf, 7);
     sys2(SYS_close, fd, 0);
-    sys3(SYS_unlink, (long)"/setting/nm_key", 0, 0);
     log_hex("NM_KEYREAD n=", (unsigned long)n);
-    if (n <= 0)
+    if (n <= 0) {
+        /* The writer may have created the file but not written it yet; do NOT
+         * unlink an empty file or the write lands in a deleted inode and the
+         * key is lost.  Retry on the next tick. */
         return;
+    }
+    sys3(SYS_unlink, (long)"/tmp/nm_key", 0, 0);
     switch (buf[0]) {
     case 'u':
-        g_selection = (g_selection + ROW_COUNT - 1u) % ROW_COUNT;
+        if (g_open && g_page)
+            popup_move(-1);
+        else
+            g_selection = (g_selection + ROW_COUNT - 1u) % ROW_COUNT;
+        g_dirty = 1;
         break;
     case 'd':
-        g_selection = (g_selection + 1u) % ROW_COUNT;
+        if (g_open && g_page)
+            popup_move(1);
+        else
+            g_selection = (g_selection + 1u) % ROW_COUNT;
+        g_dirty = 1;
         break;
     case 'c':
         g_category = (g_category + 1u) & 7u;
+        g_dirty = 1;
         break;
     case 'e':                      /* apply: step the value forward */
-        commit_step(1);
+        if (g_open && g_page)
+            popup_apply(g_opt_hover);
+        else
+            commit_step(1);
+        g_dirty = 1;
         break;
     case 'p':                      /* apply: step the value back */
         commit_step(-1);
+        g_dirty = 1;
+        break;
+    case 'n':                      /* open the second level of this row */
+        if (g_open) {
+            if (g_page)
+                popup_apply(g_opt_hover);
+            else
+                popup_open();
+            g_dirty = 1;
+        }
+        break;
+    case 'b':                      /* MENU = back */
+        nm_back();
+        break;
+    case 'T':                      /* synthetic touch from /tmp/nm_touch */
+        touch_from_file();
         break;
     case 'l':                      /* dump the option list of this row */
         list_children();
@@ -1496,6 +2233,13 @@ static void poll_key(void)
         break;
     case 's':                      /* run the option/commit self test */
         self_test();
+        break;
+    case 'x':                      /* close the overlay: stop painting */
+        overlay_close(1);
+        out("NM_CLOSE\n", 9);
+        break;
+    case 'o':                      /* re-open the overlay */
+        overlay_open();
         break;
     default:
         break;
@@ -1892,7 +2636,17 @@ static void *worker(void *arg)
              * the touch position (two words, cheap) so quick taps are caught */
             if (g_first_paint) {
                 poll_touch();
-                flip_guard();
+                if (g_open) {
+                    if (g_dirty && !paint_paused()) {
+                        g_dirty = 0;
+                        render_and_send();
+                        flip_note();
+                    } else if (!paint_paused()) {
+                        flip_guard();
+                    }
+                } else if (!paint_paused()) {
+                    badge_tick();
+                }
             }
             continue;
         }
@@ -1911,10 +2665,23 @@ static void *worker(void *arg)
             g_first_paint = now;
             log_hex("NM_FIRST_PAINT=", (unsigned long)now);
             resolve_nodes();
-            hook_input();
             flip_map();
+            /* a key file left over from a previous run must not fire now */
+            sys3(SYS_unlink, (long)"/tmp/nm_key", 0, 0);
+            sys3(SYS_unlink, (long)"/tmp/nm_key.tmp", 0, 0);
         }
         poll_key();
+        if (!g_open) {
+            /* closed: keep watching the touch cell for the switch-button tap,
+             * and keep the corner button painted over the native frames */
+            poll_touch();
+            badge_tick();
+            continue;
+        }
+        if (paint_paused()) {
+            poll_touch();
+            continue;
+        }
         poll_touch();
         if (!g_selftest_done && now >= 75 && file_exists("/setting/nm_selftest")) {
             g_selftest_done = 1;
@@ -1934,6 +2701,7 @@ static void *worker(void *arg)
                 g_tap_stage = 0;
             }
         }
+        g_dirty = 0;
         render_and_send();
         flip_note();
     }

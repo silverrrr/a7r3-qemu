@@ -41,6 +41,10 @@ A7R3（ILCE-7RM3，CXD90045）的原生菜单是按键式的老式列表。目�
 | 10 | 字体/字符串 | 从 `.ltt` 抽出原生 TrueType；resid→字符串表破解 |
 | 11 | 真正生效 | `setItemSelectedBySRNum` 改设置，10 秒后仍保持 |
 | 12 | 触摸 | 轮询 libObj 里的最后触摸点，点选/双击应用全链路打通 |
+| 13 | 二级页 | 点已选中的行打开选项弹窗（固件 SR 表 → 单选列表），点选即改值 |
+| 14 | 切换键 | 新旧菜单同一个右上角双箭头按钮；关闭时作为小补丁画在原生画面上 |
+| 15 | 交还屏幕 | 打开前抓原生帧，关闭时回写；解决"收手后原生 App 不重绘" |
+| 16 | MENU=返回 | 输入函数打补丁会崩（Exception shell），改用"原生 present"判定 |
 
 ## 4. 关键技术发现
 
@@ -86,6 +90,17 @@ App 绘制 → Sugilite 2D 命令表（(op<<16)|0xf000，0x0112=目标面）
 `InputService::callback_tp` 把坐标 `strd` 进一个 libObj 全局：
 `libObj + 0x0129eb20`（经 GOT slot `0x0121d024`，R_ARM_RELATIVE addend `0x0129eb20`），
 `[0]=x [4]=y`。轮询它即可，**不需要打代码补丁**。
+
+### 4.6 二级页面与"交还屏幕"
+
+- 二级页不是手写表：`count` 是档数，第 i 档的 SR 用 `getSRNumByIndex(node,i,&sr)`，
+  文案在 `children[i-1]`（**0 基**，`selected` 是 SR，两者差一，这里出过一次
+  off-by-one：点"精细"列表显示"标准"）。
+- 模态弹窗的遮罩不用逐像素混合（除法太慢），直接 `(v>>1)&0x7777|0xf` 减半亮度。
+- **原生 App 只在"自己有事"时 present**：叠层停止绘制不会让原生画面回来，
+  所以打开前要把 `0x202E0200` 的 640×480 抓下来，关闭时回写（+ 右上角小按钮）。
+- 想抓物理 MENU 键不要去 patch 输入函数（热路径 8 字节补丁会撕裂，guest 直接
+  掉进 Exception shell）；改用"叠层开着时 App 又 present 了"这个只读信号当返回。
 
 ## 5. 踩过的坑（重点）
 
@@ -142,8 +157,11 @@ App 绘制 → Sugilite 2D 命令表（(op<<16)|0xf000，0x0112=目标面）
 
 ## 6. 还没做完
 
-1. **真机验证**：触摸坐标尺度、原生触控 AF 干扰、真机 60 fps present 下的闪烁窗口。
-2. **完整菜单**：目前叠层只接了 6 个设置项（示例），456 项的分页/分组还没接完。
+1. **真机验证**：触摸坐标尺度、原生触控 AF 干扰、真机 60 fps present 下的闪烁窗口，
+   以及"MENU 按下 → 原生 present → 叠层自动返回"这条判定（QEMU 里注入的原生键
+   不触发重绘，只能在真机确认）。
+2. **完整菜单**：目前叠层只接了 48 行（8 分类 × 6 行）的示例，456 项的原生分页/分组
+   数据还没完全解出来（分类归属按名字近似映射）。
 3. **触摸独占**：现在只读坐标，原生触控 AF 仍会被触发（需要关掉原生触控区域）。
 4. **present 钩子**：真机 60 fps 场景下，最稳的是在 present 提交前写源面。
 
@@ -159,9 +177,16 @@ python3 tools/bake-font-atlas.py --size 26 --bits 4
 
 # 3) 装进镜像并启动
 bash payloads/scripts/install-newmenu.sh on
+bash payloads/scripts/set-newmenu-flags.sh badge on      # 原生画面上的切换按钮
 python3 tools/run-overlay-commit.py --tag demo --menu 100 --stop 160
 
-# 4) 解码固件资源 / 命令流 / RAM dump
+# 4) 实时看菜单 + 用坐标驱动（走真机同一套命中测试）
+bash payloads/scripts/see-menu.sh 8765
+python3 payloads/scripts/nm-drive.py click 600 20        # 点右上角按钮
+python3 payloads/scripts/nm-drive.py click 300 248 300 248   # 选中再点 = 开二级页
+python3 payloads/scripts/nm-drive.py snap popup
+
+# 5) 解码固件资源 / 命令流 / RAM dump
 python3 tools/uxc-strtable.py <string_simplifiedchinese.uxc> --json str_zh.json
 python3 tools/decode-cmdbuf.py <命令表 dump>
 ```
