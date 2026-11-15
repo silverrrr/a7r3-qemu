@@ -2099,6 +2099,52 @@ typedef struct {
     unsigned seq;
 } CXD90045SugiTick;
 
+
+/* Dump one configured surface (A7R3_DUMP_PA<n>) with the same tiling the panel
+ * uses.  Kept separate from cxd90045_sugi_surface_dump() so several surfaces
+ * can be captured per tick: the app alternates present targets and some views
+ * only show up in one of them. */
+static void cxd90045_sugi_dump_pa_env(const char *envname, unsigned idx)
+{
+    const char *dir = getenv("A7R3_SURF_DIR");
+    const char *s = getenv(envname);
+    static unsigned char buf[640 * 480 * 2];
+    static unsigned char lin[640 * 480 * 2];
+    char path[256];
+    FILE *f;
+    hwaddr pa;
+    unsigned x, y;
+
+    if (!dir || !s || !*s) {
+        return;
+    }
+    pa = (hwaddr)strtoull(s, NULL, 0);
+    if (!cxd90045_sugi_pa_ok(pa, sizeof(buf))) {
+        return;
+    }
+    cpu_physical_memory_read(pa, buf, sizeof(buf));
+    if (getenv("A7R3_SURF_MORTON")) {
+        for (y = 0; y < 480; y++) {
+            for (x = 0; x < 640; x++) {
+                unsigned yy = 479u - y;
+                unsigned z = (x & 1) | ((yy & 1) << 1) | ((x & 2) << 1) |
+                             ((yy & 2) << 2) | ((x & 4) << 2) |
+                             ((yy & 4) << 3);
+                unsigned off = (((yy >> 3) * 80 + (x >> 3)) * 64 + z) * 2;
+                lin[y * 1280 + x * 2] = buf[off];
+                lin[y * 1280 + x * 2 + 1] = buf[off + 1];
+            }
+        }
+        memcpy(buf, lin, sizeof(buf));
+    }
+    snprintf(path, sizeof(path), "%s/frame_%04u.raw", dir, idx);
+    f = fopen(path, "wb");
+    if (f) {
+        fwrite(buf, 1, sizeof(buf), f);
+        fclose(f);
+    }
+}
+
 static void cxd90045_sugi_tick_cb(void *opaque)
 {
     CXD90045SugiTick *t = opaque;
@@ -2109,6 +2155,12 @@ static void cxd90045_sugi_tick_cb(void *opaque)
         return;
     }
     {
+        /* every configured surface, every tick (see cxd90045_sugi_dump_pa_env) */
+        cxd90045_sugi_surface_dump(8000 + (t->seq % 500));
+        cxd90045_sugi_dump_pa_env("A7R3_DUMP_PA2", 7000 + (t->seq % 500));
+        cxd90045_sugi_dump_pa_env("A7R3_DUMP_PA3", 6000 + (t->seq % 500));
+    }
+    if (0) {
         const char *s2 = getenv("A7R3_DUMP_PA2");
         if (s2 && *s2 && (t->seq & 1)) {
             static unsigned char sub[640 * 480 * 2];

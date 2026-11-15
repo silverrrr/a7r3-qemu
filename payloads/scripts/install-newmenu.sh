@@ -36,7 +36,10 @@ mount -o loop,rw,offset=$SET_OFF,sizelimit=20971520 "$IMG" "$S" || { echo SET_MO
 rm -f "$S/newmenu.log"
 if [ "$MODE" = "on" ]; then
     : > "$S/newmenu"
-    echo "created /setting/newmenu"
+    # corner switch button over the native screen (verified not to disturb the
+    # app's own drawing, see A7R3_NOTES 64); remove the file to turn it off
+    : > "$S/nm_badge"
+    echo "created /setting/newmenu and /setting/nm_badge"
 else
     rm -f "$S/newmenu"
     echo "removed /setting/newmenu"

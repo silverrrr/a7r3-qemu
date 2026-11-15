@@ -82,10 +82,11 @@ docs/
   这条路径还没在真机验证；确定可用的是页脚"MENU 返回"、右上角按钮与 `b` 通道。
 - **原生菜单是按键式 UI**（触摸只用于对焦），所以网页里点旧菜单必须由宿主翻译成
   按键（移动选择 + ENTER）；`/nmclick` 在叠层关闭时会自动走这条路。
-- **原生画面上的右上角小按钮默认关闭**（`/setting/nm_badge` 才打开）：它往原生渲染
-  目标补像素，会和 App 正在画的警告对话框撞车，导致对话框变黑屏。
+- **看到"黑屏"先确认抓的是哪一块缓冲**：App 是双缓冲 present，警告对话框这类视图
+  只落在其中一块上。模型现在每 tick dump 三块（渲染目标 + 两块 present），网页取
+  "最新的非全黑帧"，所以对话框能正常显示（`payloads/scripts/patch-bionz-3pa.py`）。
 - 反复强杀 QEMU 会把 guest `/tmp` 的 FAT 写脏 → 只读挂载 → 叠层的 `/tmp` 通道失效，
-  用 `payloads/scripts/fsck-guest-tmp.sh fix` 修。
+  用 `payloads/scripts/fsck-guest-tmp.sh fix` 修（`see-menu.sh` 启动时会自动查/修）。
 - 不提供任何绕过设备保护措施的内容（引导链/恢复通道章节已删除）。
 
 ## 6. 引用与致谢

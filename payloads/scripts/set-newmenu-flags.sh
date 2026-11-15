@@ -23,7 +23,7 @@ umount "$S" 2>/dev/null
 mount -o loop,rw,offset=$((524288 + 18432 * 512)),sizelimit=20971520 "$IMG" "$S" || {
   echo SET_MOUNT_FAIL; exit 1; }
 
-name="$1"; mode="${2:-}"
+name="${1:-}"; mode="${2:-}"
 if [ -z "$name" ]; then
     ls -la "$S" | grep -E 'newmenu|nm_' || true
     umount "$S"
