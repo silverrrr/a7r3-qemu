@@ -5833,3 +5833,35 @@ NM_commit_sr=0x14de67c7
 - `fsck-guest-tmp.sh clean`：`/tmp` 满（12 MB）会让按键通道静默失效；
 - `boot-until-ready.sh`：自动重试 ~1/3 概率的启动竞态；脚本成功后要 `wait`，
   否则 viewer 会随父进程一起退出（这轮第二次验证就是被这个打断的）。
+
+### 66.14 ★ Step 2 完成并验证：456 项枚举也不再调 dlsym（零回退）
+
+补丁 `qemu_a7r3/patch-step2-nodes.py`，只动 `collect_items()` 里给节点定址的那几行：
+
+| 之前 | 现在 |
+| --- | --- |
+| 每个符号 `dlsym(g_caution, name)` 取地址 | `node_addr = base + st_value`（`st_value` 是模块内偏移，正是加载器绑定的那个地址） |
+| 校验逻辑散在循环里、失败就 `continue` | 抽成 `node_ok()`（vptr 可信 + count∈[0,200] + children 全可读） |
+| —— | `dlsym` 只在 `node_ok(base + st_value)` 失败时兜底，并计数 `NM_refl_fb` |
+
+两次干净启动的实测（**模块基址两次都不同**，说明地址确实是算出来的，不是记死的）：
+
+```
+boot A: NM_elf_base=0x14693000  NM_items=0x1c8  NM_refl=0x1c8  NM_refl_fb=0x0
+boot B: NM_elf_base=0x143dc000  NM_items=0x1c8  NM_refl=0x1c8  NM_refl_fb=0x0
+```
+
+- `0x1c8 = 456`，8 个页签分布 54/89/150/23/25/16/43/56 与 §65 一致；
+- 行值仍是真实值（拍摄=自动、APS-C=1/1、创意风格=标准 …），二级页 `NM_POPUP apply`
+  照常生效（`NM_POPUP tap=1 → idx=1 → sr=1 → selected=1`）。
+
+⇒ **整个载荷的菜单路径现在完全不碰 dlopen/dlsym**（`libObj.so` 的位图函数、
+`CautionConfig.so` 的 getter/setter、456 个节点地址全部走反射）。
+剩下要 dlopen 的只有两段式 stub（那是下一步，尚未做）。
+
+这轮的一个坑（看图别信 HTTP）：`boot-until-ready.sh` 在 viewer 返回 200 后再等 40 s，
+但 QEMU 里应用把菜单画完要 ~90–120 s；提前点右上角会看到"只有行线、没有文字"的
+黑屏截图，而 `NM_items` 其实早已是 456。**判断就绪要看实际画面，不要只看 HTTP 200。**
+
+小工具：`nm-click.sh X Y [sleep]`（一次合成触摸）、`nm-log2.py all`（打印原始
+`/tmp/newmenu.log` 尾部）。

@@ -5,13 +5,6 @@
  * (see CREDITS.md and LICENSE).
  */
 
-/* menu_overlay.c -- new-menu overlay for the A7R3.
- *
- * Original work (MIT).  It links the zve10-derived renderer in menu_shell.c,
- * so builds that include menu_shell.c are noncommercial only
- * (see CREDITS.md and LICENSE).
- */
-
 /* menu_overlay.c -- draw a complete "new menu" onto the A7R3 panel.
  *
  * Renders 640x480 RGBA4444:
@@ -390,7 +383,7 @@ static int pm_readable(const void *p, unsigned len);
 /* complete menu: enumerate every setting node at run time              */
 /*                                                                     */
 /* CautionConfig.so exports 456 cmnViewSettingNodeRoot* objects (all in */
-/* .bss, so dlsym() returns the node itself).  Instead of a hard-coded  */
+/* .bss, so base+st_value is the node itself).  Instead of a hard-coded  */
 /* 48-item table we parse the already-loaded ELF's dynamic symbol table */
 /* in memory: that needs no symbol names in this payload and stays       */
 /* correct if the firmware ever changes.                                */
@@ -410,6 +403,8 @@ static void *g_caution;            /* CautionConfig.so handle (dlopen) */
 
 static struct menu_item g_items[MAX_ITEMS];
 static int g_item_count;
+static int g_refl_hit;             /* nodes found via base + st_value */
+static int g_refl_fb;              /* nodes that needed the dlsym fallback */
 static unsigned g_tab_first[CAT_COUNT];   /* index into g_items */
 static unsigned g_tab_items[CAT_COUNT];
 static int g_tab_error;
@@ -625,6 +620,40 @@ static unsigned long elf_base_of(unsigned long addr)
     return 0;
 }
 
+
+/* Is `node_addr` really a CmnViewSettingNode?  Used by the enumeration below:
+ * a bad st_value would hand us garbage that only crashes later, when the menu
+ * draws it, so every address is validated before it is accepted. */
+static int node_ok(unsigned long node_addr)
+{
+    void *children = NULL;
+    unsigned vptr = 0;
+    int count = 0, c2;
+
+    if (!pm_readable((const void *)node_addr, sizeof(struct node)))
+        return 0;
+    __builtin_memcpy(&vptr, (const void *)node_addr, 4);
+    if (!plausible((const void *)(unsigned long)vptr))
+        return 0;
+    /* `count` must look like an option count and the children array has to be
+     * readable: this filters out any symbol whose address is not a node */
+    __builtin_memcpy(&children, (const void *)(node_addr + 4), 4);
+    __builtin_memcpy(&count, (const void *)(node_addr + 8), 4);
+    if (count < 0 || count > 200)
+        return 0;
+    if (count > 0 && !pm_readable(children, (unsigned)count * 4u))
+        return 0;
+    /* every child has to be a readable node as well */
+    for (c2 = 0; c2 < count; c2++) {
+        unsigned long cp = 0;
+        __builtin_memcpy(&cp, (const void *)((const char *)children + c2 * 4), 4);
+        if (!plausible((const void *)cp) ||
+            !pm_readable((const void *)cp, sizeof(struct node)))
+            return 0;
+    }
+    return 1;
+}
+
 /* walk the dynamic section of the module `base` and collect our nodes */
 static int collect_items(unsigned long base)
 {
@@ -738,7 +767,6 @@ static int collect_items(unsigned long base)
         unsigned st_name, st_value;
         const char *name;
         unsigned long node_addr;
-        unsigned vptr;
         int k, nul = 0, bad = 0;
 
         if (!pm_readable(sym, 16))
@@ -773,44 +801,22 @@ static int collect_items(unsigned long base)
             continue;
         if (__builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) != 0)
             continue;
-        /* the object itself must be readable and start with a plausibly
-         * relocated vtable pointer -- otherwise a bad st_value would hand us a
-         * garbage node that crashes the app later, when the menu draws it.
-         * dlsym() is authoritative here: it returns the address the loader
-         * actually bound, so we never have to trust our own st_value math. */
-        {
-            void *sym_addr = g_caution ? dlsym(g_caution, name) : NULL;
+        /* st_value is the module-relative offset of the object, so the node
+         * sits at base + st_value -- the same address dlsym() used to return
+         * for these exported .bss objects.  No dlopen/dlsym on the normal
+         * path any more; the loader lookup survives only as a fallback for a
+         * symbol whose relocated address does not validate. */
+        node_addr = base + (unsigned long)st_value;
+        if (node_ok(node_addr)) {
+            g_refl_hit++;
+        } else {
+            void *sym_addr =
+                (dlsym && g_caution) ? dlsym(g_caution, name) : NULL;
             if (!sym_addr)
                 continue;
             node_addr = (unsigned long)sym_addr;
-        }
-        if (!pm_readable((const void *)node_addr, sizeof(struct node)))
-            continue;
-        __builtin_memcpy(&vptr, (const void *)node_addr, 4);
-        if (!plausible((const void *)(unsigned long)vptr))
-            continue;
-        {
-            /* `count` must look like an option count and the children array has
-             * to be readable: this filters out any symbol whose address is not
-             * really a node (which would crash the menu later) */
-            void *children = NULL;
-            int count = 0;
-            int c2;
-            __builtin_memcpy(&children, (const void *)(node_addr + 4), 4);
-            __builtin_memcpy(&count, (const void *)(node_addr + 8), 4);
-            if (count < 0 || count > 200)
-                continue;
-            if (count > 0 && !pm_readable(children, (unsigned)count * 4u))
-                continue;
-            /* every child has to be a readable node as well */
-            for (c2 = 0; c2 < count; c2++) {
-                unsigned long cp = 0;
-                __builtin_memcpy(&cp, (const void *)((const char *)children + c2 * 4), 4);
-                if (!plausible((const void *)cp) ||
-                    !pm_readable((const void *)cp, sizeof(struct node)))
-                    break;
-            }
-            if (count > 0 && c2 < count)
+            g_refl_fb++;
+            if (!node_ok(node_addr))
                 continue;
         }
         g_items[g_item_count].name = name;
@@ -908,6 +914,8 @@ static void resolve_nodes(void)
     }
     rc = collect_items(base);
     log_hex("NM_items=", (unsigned long)rc);
+    log_hex("NM_refl=", (unsigned long)g_refl_hit);
+    log_hex("NM_refl_fb=", (unsigned long)g_refl_fb);
     if (rc <= 0) {
         out("NM_FAIL items\n", 14);
         g_tab_error = 1;
