@@ -25,7 +25,21 @@
 | 关闭时交还原生画面 | ✅ | 打开前抓原生帧，关闭时回写（+ 20 ms 守卫） |
 | 真机验证 | ⏳ | 需要一次真机会话（触摸尺度、60 fps 闪烁、MENU 键） |
 
-## 2. 原理
+## 2. 截图（QEMU 实拍，均为 640×480 面板）
+
+| 原生菜单（旧） | 新菜单叠层 |
+| --- | --- |
+| ![原生菜单](docs/images/old-menu-native.png) | ![新菜单](docs/images/new-menu-overlay.png) |
+
+| 二级页面（选项弹窗） | 原生警告框（也可以在叠层下面正常显示） |
+| --- | --- |
+| ![选项弹窗](docs/images/new-menu-options.png) | ![警告框](docs/images/native-caution.png) |
+
+说明：右上角那个绿色双箭头是"新旧菜单切换"按钮，两种状态下都在同一位置。
+原生菜单是**按键式**的（触摸只做对焦），所以网页里点旧菜单会被翻译成
+"移动选择 + ENTER"。
+
+## 3. 原理
 
 ```
 启动：u-boot → Linux → initrd → /usr/bin/... → im.elf
@@ -43,7 +57,7 @@
       └─ 触摸：轮询 libObj+0x0129eb20 的 (x, y)
 ```
 
-## 3. 仓库结构
+## 4. 仓库结构
 
 ```
 payloads/            注入到相机进程里的 .so 源码
@@ -57,22 +71,40 @@ qemu/
 tools/                 离线分析与解码工具（固件解包、UXC/字体、命令流、RAM dump）
 docs/
   SUMMARY.md           做了什么 + 踩过的坑（推荐先读）
+  FIRMWARE.md          怎么从你自己的相机 dump 固件（只读，仓库不含数据）
   A7R3_NOTES.md        完整技术笔记（公开版：已删除引导/恢复章节）
   HANDOFF.md           项目状态与工具索引
+  images/              新旧菜单、二级页、警告框的截图
 ```
 
-## 4. 快速开始
+## 5. 快速开始
 
 > 需要：Linux（WSL 可用）、QEMU 源码树、`clang`/`lld`（ARM 交叉）、Python 3 + Pillow，
 > 以及**你自己的** A7R3 固件（eMMC 镜像、内核与 initrd）。
+>
+> 固件怎么来：见 **[docs/FIRMWARE.md](docs/FIRMWARE.md)** —— 从你自己的相机做**只读**
+> 分区 dump、拼成 QEMU 用的 eMMC 镜像。仓库里不含任何固件数据。
 
 1. 把 `qemu/bionz.c` 放进 QEMU 的 `hw/arm/`，并在 `hw/arm/Makefile.objs` 与
    `default-configs/arm-softmmu.mak` 里注册 `cxd90045` 机器（见 `qemu/README.md`）。
 2. 用 `payloads/scripts/build-shim*.sh`、`build-newmenu.sh` 构建 payload。
 3. 字体/图标等素材**不随仓库提供**：按 `docs/SUMMARY.md` 第 5 节从你自己的固件里生成。
-4. 用 `tools/` 里的脚本启动、注入按键、抓帧、解码。
+4. 一条命令跑起来（QEMU + 网页实时画面，<http://localhost:8765/>）：
 
-## 5. 已知限制
+```bash
+bash payloads/scripts/see-menu.sh 8765
+```
+
+命令行驱动画面（点按/按键/截图）：
+
+```bash
+python3 payloads/scripts/nm-drive.py click 600 20     # 右上角：进/出新菜单
+python3 payloads/scripts/nm-drive.py click 300 248    # 旧菜单点行；再点一次 = ENTER
+python3 payloads/scripts/nm-drive.py snap demo        # 存快照
+python3 payloads/scripts/nm-inspect.py 6              # 最近 6 帧的"年龄/内容分/PNG"
+```
+
+## 6. 已知限制
 
 - 只在 QEMU 中验证；真机差异（触摸坐标尺度、60 fps present 下的闪烁窗口、
   原生触控 AF 干扰）尚未验证。
@@ -89,7 +121,7 @@ docs/
   用 `payloads/scripts/fsck-guest-tmp.sh fix` 修（`see-menu.sh` 启动时会自动查/修）。
 - 不提供任何绕过设备保护措施的内容（引导链/恢复通道章节已删除）。
 
-## 6. 引用与致谢
+## 7. 引用与致谢
 
 本项目的部分代码来自公开研究，**必须保留其署名与许可证**：
 
@@ -103,11 +135,13 @@ docs/
 还有一批提供思路与资料的仓库（a7c2-qemu、a7m3-qemu、Sony_A7M3 等），
 完整清单、作者与许可证见 **[CREDITS.md](CREDITS.md)**。
 
-## 7. 法律与合规
+## 8. 法律与合规
 
 本项目仅用于**互操作性研究**与**自有设备**的界面实验：
 
 - 不含 Sony 固件或任何专有资产，不提供下载；
+- **截图**（`docs/images/`）是在自有设备的模拟环境里抓的界面图，仅作研究说明/评论用途，
+  界面设计与相关商标归 Sony 所有；
 - 不要在未授权设备上使用；不要用于绕过版权保护或签名校验；
 - 反编译/分析在部分司法辖区受当地法律与许可协议约束，使用前请自行确认合规；
 - 因使用本仓库导致的任何后果由使用者自负。
