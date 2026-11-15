@@ -36,7 +36,6 @@ typedef unsigned int u32;
 #define MENU_H 480
 
 extern void *dlsym(void *handle, const char *name) __attribute__((weak));
-extern void *dlopen(const char *path, int flags) __attribute__((weak));
 
 #define RTLD_DEFAULT ((void *)0)
 
@@ -399,7 +398,6 @@ struct menu_item {
     const char *name;              /* points into the module's strtab */
 };
 
-static void *g_caution;            /* CautionConfig.so handle (dlopen) */
 
 static struct menu_item g_items[MAX_ITEMS];
 static int g_item_count;
@@ -460,6 +458,20 @@ static int any_starts(const char *name, const char *const *keys)
     return 0;
 }
 
+/* our own byte compare: a call to libc's memcmp would go through a lazy PLT
+ * slot, and this firmware's dynamic linker only resolves preloaded objects
+ * eagerly -- inside a dlopen()ed payload the first memcmp() jumps to 0.
+ * (The crash that pinned this down: pc=0, LR pointing into this module's own
+ * .data after NM_elf_base, two-stage loader only.) */
+static int nm_bytes_eq(const char *a, const char *b, unsigned n)
+{
+    unsigned i;
+    for (i = 0; i < n; i++)
+        if (a[i] != b[i])
+            return 0;
+    return 1;
+}
+
 /* which of the eight tabs an item belongs to (first match wins) */
 static int tab_of_name(const char *name)
 {
@@ -492,7 +504,7 @@ static int tab_of_name(const char *name)
 
     /* names arrive as the raw symbol ("cmnViewSettingNodeRootCustomButtonH"):
      * match against the part after the common prefix */
-    if (name && __builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) == 0)
+    if (name && nm_bytes_eq(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1))
         name += sizeof(SYM_PREFIX) - 1;
 
     if (any_starts(name, t_custom))
@@ -762,6 +774,11 @@ static int collect_items(unsigned long base)
     if (nchain < 8 || nchain > 65536)
         nchain = 4096;
 
+    log_hex("NM_C_dyn=", dyn);
+    log_hex("NM_C_sym=", symtab);
+    log_hex("NM_C_str=", strtab);
+    log_hex("NM_C_nchain=", nchain);
+
     for (i = 1; i < nchain && g_item_count < MAX_ITEMS; i++) {
         const unsigned char *sym = (const unsigned char *)(symtab + i * 16);
         unsigned st_name, st_value;
@@ -799,26 +816,16 @@ static int collect_items(unsigned long base)
         }
         if (bad || !nul)
             continue;
-        if (__builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) != 0)
+        if (!nm_bytes_eq(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1))
             continue;
         /* st_value is the module-relative offset of the object, so the node
-         * sits at base + st_value -- the same address dlsym() used to return
-         * for these exported .bss objects.  No dlopen/dlsym on the normal
-         * path any more; the loader lookup survives only as a fallback for a
-         * symbol whose relocated address does not validate. */
+         * sits at base + st_value.  This is the only way addresses are made:
+         * no dlopen()/dlsym() anywhere -- the payload has to work when it was
+         * itself dlopen()ed by the two-stage loader (NOTES 66.9). */
         node_addr = base + (unsigned long)st_value;
-        if (node_ok(node_addr)) {
-            g_refl_hit++;
-        } else {
-            void *sym_addr =
-                (dlsym && g_caution) ? dlsym(g_caution, name) : NULL;
-            if (!sym_addr)
-                continue;
-            node_addr = (unsigned long)sym_addr;
-            g_refl_fb++;
-            if (!node_ok(node_addr))
-                continue;
-        }
+        if (!node_ok(node_addr))
+            continue;
+        g_refl_hit++;
         g_items[g_item_count].name = name;
         g_items[g_item_count].node = (struct node *)node_addr;
         g_item_count++;
@@ -879,6 +886,38 @@ static void build_tabs(void)
     }
 }
 
+static unsigned long mod_base(const char *needle);   /* defined below */
+
+/* Debug aid: copy this process's map table next to the overlay log.  When the
+ * payload dies (two-stage loader) the guest shell is gone, but /tmp survives
+ * in the image, so this is how a crash address gets resolved to a module. */
+static void dump_maps_snapshot(void)
+{
+    static char buf[65536];
+    int fd, n, out;
+    long r;
+
+    fd = (int)sys3(SYS_open, (long)"/proc/self/maps", 0, 0);
+    if (fd < 0)
+        return;
+    n = 0;
+    while (n < (int)sizeof(buf) - 1) {
+        r = sys3(SYS_read, fd, (long)(buf + n),
+                 (long)(sizeof(buf) - 1 - (unsigned)n));
+        if (r <= 0)
+            break;
+        n += (int)r;
+    }
+    sys2(SYS_close, fd, 0);
+    if (n <= 0)
+        return;
+    out = (int)sys3(SYS_open, (long)"/tmp/nm_maps.log", O_TRUNC_CREAT, 0644);
+    if (out < 0)
+        return;
+    sys3(SYS_write, out, (long)buf, (long)n);
+    sys2(SYS_close, out, 0);
+}
+
 static void resolve_nodes(void)
 {
     unsigned long base = 0;
@@ -886,32 +925,21 @@ static void resolve_nodes(void)
 
     if (g_item_count || g_tab_error)
         return;
-    if (!dlopen || !dlsym) {
-        out("NM_NO_DL\n", 9);
-        g_tab_error = 1;
-        return;
-    }
     pm_reload_maps();
-    g_caution = dlopen("/usr/lib/CautionConfig.so", 5 /* RTLD_LAZY|RTLD_NOLOAD */);
-    log_hex("NM_caution=", (unsigned long)g_caution);
-    if (!g_caution) {
-        out("NM_FAIL caution\n", 16);
-        g_tab_error = 1;
-        return;
-    }
-    {
-        void *any = dlsym(g_caution, "cmnViewSettingNodeRoot24pMode");
-        log_hex("NM_sym_any=", (unsigned long)any);
-        base = module_base_from_maps("CautionConfig.so");
-        if (!base && any)
-            base = elf_base_of((unsigned long)any);
-    }
+    /* the module base comes from /proc/self/maps: nothing is loaded here, so
+     * this works the same whether we were preloaded or dlopen()ed.
+     * mod_base() = lowest mapping that names the module (the same lookup the
+     * symbol reflection uses); module_base_from_maps() insists on file offset
+     * 0 and silently fails here, so it is only logged for diagnosis. */
+    base = mod_base("/CautionConfig.so");
+    log_hex("NM_base_off0=", (unsigned long)module_base_from_maps("CautionConfig.so"));
     log_hex("NM_elf_base=", base);
     if (!base) {
         out("NM_FAIL base\n", 13);
         g_tab_error = 1;
         return;
     }
+    dump_maps_snapshot();
     rc = collect_items(base);
     log_hex("NM_items=", (unsigned long)rc);
     log_hex("NM_refl=", (unsigned long)g_refl_hit);
@@ -2716,15 +2744,15 @@ static void sr_report(const char *tag)
     int i, v;
 
     log_utf8("NM_SR_TAG ", tag);
-    if (!n || !g_caution)
+    if (!n)
         return;
-    f_srsel = (getint_fn)dlsym(g_caution,
+    f_srsel = (getint_fn)mod_sym("/CautionConfig.so",
         "_ZN18CmnViewSettingNode20getSRNumSelectedItemERi");
-    f_sridx = (getint2_fn)dlsym(g_caution,
+    f_sridx = (getint2_fn)mod_sym("/CautionConfig.so",
         "_ZN18CmnViewSettingNode15getSRNumByIndexEiRi");
-    f_state = (getint2_fn)dlsym(g_caution,
+    f_state = (getint2_fn)mod_sym("/CautionConfig.so",
         "_ZN18CmnViewSettingNode15getStateByIndexEiRi");
-    f_issel = (getint1_fn)dlsym(g_caution,
+    f_issel = (getint1_fn)mod_sym("/CautionConfig.so",
         "_ZN18CmnViewSettingNode21isItemSelectedByIndexEi");
     v = -12345;
     if (f_srsel) {
@@ -2765,7 +2793,7 @@ static void self_test(void)
         out("NM_SELFTEST noapi\n", 18);
         return;
     }
-    f_sridx = (getint2_fn)dlsym(g_caution,
+    f_sridx = (getint2_fn)mod_sym("/CautionConfig.so",
         "_ZN18CmnViewSettingNode15getSRNumByIndexEiRi");
     if (!f_sridx) {
         out("NM_SELFTEST noget\n", 18);
@@ -3398,26 +3426,21 @@ static void pm_scan(const void *base, unsigned span)
 }
 
 typedef void *(*eng_inst_fn)(void);
-typedef void *(*dlopen_fn2)(const char *, int);
 
 static void present_wrapper_args(long a);
 static long present_wrapper(long a, long b, long c, long d);
 
 static void find_surface(void)
 {
-    dlopen_fn2 dop = (dlopen_fn2)dlopen;
-    void *obj;
     eng_inst_fn inst;
     void *eng;
     int i;
 
-    if (g_surface || !dop)
+    if (g_surface)
         return;
-    obj = dop("/usr/lib/libObj.so", 5);
-    log_hex("NM_obj2=", (unsigned long)obj);
-    if (!obj)
-        return;
-    inst = (eng_inst_fn)dlsym(obj, "_ZN2ux6gfxeng14GraphicsEngine15sys_getInstanceEv");
+    inst = (eng_inst_fn)mod_sym("/libObj.so",
+        "_ZN2ux6gfxeng14GraphicsEngine15sys_getInstanceEv");
+    log_hex("NM_eng_inst=", (unsigned long)inst);
     eng = inst ? inst() : NULL;
     log_hex("NM_eng=", (unsigned long)eng);
     if (!eng)
@@ -3516,9 +3539,6 @@ static long present_wrapper(long a, long b, long c, long d)
 
 static void install_present_hook(void)
 {
-    void *obj;
-    dlopen_fn2 dop = (dlopen_fn2)dlopen;
-    void *fn;
     void *orig = NULL;
     unsigned long base;
     int rc;
@@ -3526,16 +3546,10 @@ static void install_present_hook(void)
     if (g_present_tried)
         return;
     g_present_tried = 1;
-    if (!dop)
-        return;
-    obj = dop("/usr/lib/libObj.so", 5);
-    if (!obj)
-        return;
-    fn = dlsym(obj, "GRM_bitmapCreate");
-    if (!fn)
-        return;
-    base = (unsigned long)fn - 0x636bd9UL;    /* GRM_bitmapCreate file vaddr */
+    base = libobj_base();          /* reflection: no dlopen/dlsym */
     log_hex("NM_objbase=", base);
+    if (!base)
+        return;
     rc = hook_thumb2(base + 0x719510UL, (void *)present_wrapper, &orig);
     log_hex("NM_present_rc=", (unsigned long)rc);
     if (rc == 0) {
@@ -3669,10 +3683,6 @@ __attribute__((constructor)) static void menu_overlay_init(void)
         out("NM_DISARMED\n", 13);
         return;
     }
-    if (!dlsym) {
-        out("NM_NO_DLSYM\n", 12);
-        return;
-    }
 #ifdef NM_LITE
     (void)create;
     (void)tid;
@@ -3683,7 +3693,7 @@ __attribute__((constructor)) static void menu_overlay_init(void)
      * DT_NEEDED libc.so.6 and works both for preload and dlopen */
     if (pthread_create)
         create = pthread_create;
-    else
+    else if (dlsym)
         create = (pthread_create_fn)dlsym(RTLD_DEFAULT, "pthread_create");
     if (!create) {
         out("NM_NO_PTHREAD\n", 14);

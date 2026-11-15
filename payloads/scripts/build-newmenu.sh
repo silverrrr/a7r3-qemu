@@ -21,6 +21,7 @@ clang --target=arm-linux-gnueabi -march=armv7-a -mfloat-abi=soft \
   -fno-unwind-tables -fno-asynchronous-unwind-tables \
   -I. \
   -Wall -Wno-unused-parameter \
+  -Wl,-z,now \
   $EXTRA \
   -o newmenu.so menu_overlay.c menu_shell.c
 

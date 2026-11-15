@@ -539,6 +539,13 @@ def main():
             if not ch:
                 return
             console.extend(ch)
+            # keep a file copy: the guest's exception monitor writes its fault
+            # dump to this console, and that is the only way to see it
+            try:
+                with open(os.path.join(args.dir, "console.log"), "ab") as cf:
+                    cf.write(ch)
+            except OSError:
+                pass
 
     stop = threading.Event()
 

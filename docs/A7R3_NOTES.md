@@ -5865,3 +5865,81 @@ boot B: NM_elf_base=0x143dc000  NM_items=0x1c8  NM_refl=0x1c8  NM_refl_fb=0x0
 
 小工具：`nm-click.sh X Y [sleep]`（一次合成触摸）、`nm-log2.py all`（打印原始
 `/tmp/newmenu.log` 尾部）。
+
+### 66.15 ★★ Step 3 完成：两段式 dlopen 载荷跑通（2026-11-15 傍晚）
+
+三件事一起做完了：载荷里**彻底没有 dlopen**，两段式 stub 能把完整载荷 dlopen 起来，
+并且菜单真的能用（456 项、真实值、二级页）。
+
+#### (1) 载荷去掉最后三个 dlopen
+
+| 位置 | 原来 | 现在 |
+| --- | --- | --- |
+| `resolve_nodes()` | `dlopen(CautionConfig, RTLD_NOLOAD)` 只为拿句柄给 `dlsym` | 直接 `mod_base("/CautionConfig.so")` 从 maps 取基址 |
+| `find_surface()`（`nm_present` 门控） | `dlopen(libObj)` + `dlsym(sys_getInstance)` | `mod_sym("/libObj.so", …)` |
+| `install_present_hook()`（同上） | `dlopen(libObj)` + `dlsym(GRM_bitmapCreate)` | `libobj_base()`（step 1 已是反射） |
+
+顺带：`sr_report`/`self_test` 里的 `dlsym(g_caution, …)` 改成 `mod_sym`，枚举里的 dlsym
+兜底删掉（`NM_refl_fb` 保留，恒 0），构造函数不再要求 `dlsym` 存在。
+`readelf -r` 确认：**没有任何 dlopen 重定位**，未定义函数符号只剩弱引用
+`dlsym`/`pthread_create`。
+
+#### (2) `module_base_from_maps()` 其实是坏的
+
+去掉 dlsym 后第一次跑立刻暴露：`NM_elf_base=0x0`、`NM_FAIL base`。
+原因还是老问题：它要求 mapping 的**文件偏移为 0** 才认，而这个固件映射 CautionConfig 时
+那条线不满足；`mod_base()`（取含模块名的最低 lo）才是对的。现在枚举用 `mod_base()`，
+旧函数只留一行 `NM_base_off0=` 做对照（实测恒 0）。
+
+#### (3) 两段式崩在 `pc=0`，真凶是 memcmp 的惰性 PLT
+
+现象：stub 日志 `NM_BOOT dlopen=… / loaded` 正常，载荷日志能写到
+`NM_elf_base=…`，然后 guest 立刻进 `Exception>`（`page translation fault at 0x0`，
+`pc=0`，LR 指在载荷自己的 `.data` 页上）。
+
+定位手段（这轮新加的，值得留着）：
+
+| 工具 | 作用 |
+| --- | --- |
+| `live-menu.py` 写 `analysis/live/console.log` | guest 异常监视器的完整寄存器/调用栈只在这里 |
+| 载荷里 `dump_maps_snapshot()` → `/tmp/nm_maps.log` | 崩之前把 `/proc/self/maps` 落盘，事后能把 pc/lr 解析到具体模块 |
+| `read-guest-tmp.sh` | QEMU 硬停后从镜像里把 `/tmp/*.log` 拷出来（`/sh` 在异常 shell 里不可用） |
+
+有了 maps 就能看出 LR 落在载荷 `rw-p` 数据页、而代码段另有一段，
+说明不是普通的函数调用——是**跳到了 0**。
+
+根因：载荷是 `-nostdlib` 编的，`__builtin_memcmp` 被编译成对 libc `memcmp@GLIBC_2.4`
+的**惰性 PLT 调用**。预加载（`LD_PRELOAD`）时加载器会把重定位**立即**做完，所以单段式
+从来没事；`dlopen(..., RTLD_LAZY)` 把 memcmp 留到第一次调用，而这个固件的加载器在
+惰性绑定路径上跳到了 0。
+
+修法（两条都做了，互为保险）：
+
+1. 自己写字节比较 `nm_bytes_eq()`，枚举里两处 `__builtin_memcmp` 全换掉；
+2. 构建加 `-Wl,-z,now`，让剩下的 PLT 槽在 dlopen 时一次性绑定。
+
+#### (4) 实测结果
+
+同一套 stub + `/setting/newmenu.so`，干净启动：
+
+```
+NM_BOOT alive / tid=… / wait /setting/newmenu.so
+NM_BOOT dlopen=0xaac68 / loaded
+（无 Exception Monitor）
+NM_items=0x1c8   NM_refl=0x1c8   NM_refl_fb=0x0
+NM_getsr=0x151fe3f9
+```
+
+菜单照常显示 54 项 / 1/9 页与真实值，点右上角开合正常。
+⇒ **"把 .so 放在可写分区（将来是 SD 卡）、开机由极小 stub 加载"这条路线在 QEMU 里走通了。**
+
+#### (5) 这轮踩的坑
+
+- 安装脚本在 QEMU 还在跑的时候去挂载镜像：`install-nm-boot.sh` 会直接往 vfat/ext4 写，
+  和运行中的 QEMU 抢同一个镜像。必须**先停 QEMU 再安装**；事后 `check-image-usr.sh`
+  （新脚本，`e2fsck -fn`）确认 `/usr` 干净。
+- PowerShell 会吃掉双引号里的 `$var`、`&`、heredoc：所有多步命令都写进 `.sh`/`.py`
+  再执行。
+- `boot-until-ready.sh` 成功只代表 viewer 活着；判断应用画完要看帧内容（§66.14 已记）。
+- 那个 ~1/3 概率的启动竞态依旧存在：`pc=0x041739c8 / 0x2275e780 (uxengine_res1)`
+  是它，不是载荷问题（`pc` 非 0、LR=0、任务名不同）。
