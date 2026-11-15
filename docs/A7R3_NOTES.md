@@ -5729,3 +5729,33 @@ preload = /usr/tool/libefence.so : /log/libIMDB_m2.so : /log/bindm2.so
 现状（已还原）：**单段式**（`/usr/tool/newmenu.so` 作为 preload）+ 装载门铃
 `/setting/{nm_arm,nm_off}`；本次验证启动 fault 在 `0x00152c38`，正是那个已知的
 启动竞态，不是我们的代码。
+
+### 66.9 两段式二分：dlopen 能成，崩在 worker
+
+按 66.8 的线索继续二分（每次只改一个变量，启动一次）：
+
+| 载荷 | 结果 |
+| --- | --- |
+| `nm_probe.so`（1.8 KB，构造函数只打一行日志） | `NM_PROBE alive` + `NM_BOOT dlopen=0x368b8` + `loaded`，**0 次异常** ⇒ **这个固件可以 dlopen 我们的 freestanding .so** |
+| `nm_lite.so`（完整载荷 + `-DNM_LITE`，构造函数不建 worker） | `loaded`，**0 次异常** |
+| 完整载荷（`NEEDED libc.so.6` + 直接弱引用 `pthread_create`） | `NM_BOOT loaded` 之后仍 `page translation fault at 0x00000000` |
+
+⇒ 结论修正：**问题不在 dlopen，也不在构造函数**，而在**worker 跑起来之后**。
+结合 66.8（不延迟、延迟 40 s 都崩），最可能是 worker 到 t≈60 s 首次绘制时调用的
+`dlopen("/usr/lib/CautionConfig.so", RTLD_LAZY|RTLD_NOLOAD)` —— 从"被 dlopen 进来的
+库"里再做嵌套 dlopen，这个老 glibc（2.11.2）上不保证安全。
+
+**下一步（未做）**：让 stub 在 dlopen 载荷之前先把 `CautionConfig.so` / `libObj.so`
+用 `RTLD_GLOBAL` 打开，并把句柄通过一个约定符号交给载荷（载荷里就不再自己做
+`dlopen`/`dlsym(RTLD_DEFAULT)`），或者干脆让载荷改用 handle 版 dlsym。
+
+**当前镜像状态**：已还原为单段式（`/usr/tool/newmenu.so` 作为 preload）+
+装载门铃 `/setting/nm_arm`；`/setting` 里的 `probe.so`/`lite.so` 已清理。
+
+### 66.10 二分用的脚手架
+
+| 文件 | 作用 |
+| --- | --- |
+| `payloads/nm_probe.c` + `build-nm-probe.sh` | 1.8 KB 最小 dlopen 探针 |
+| `-DNM_LITE`（`menu_overlay.c` 构造函数里的 `#ifdef`） | 只加载不启动 worker 的变体 |
+| `patch-overlay-direct-pthread.py` | 构造函数优先用弱引用 `pthread_create`（dlopen 路径需要），失败再 dlsym |

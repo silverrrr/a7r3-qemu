@@ -3429,7 +3429,18 @@ __attribute__((constructor)) static void menu_overlay_init(void)
         out("NM_NO_DLSYM\n", 12);
         return;
     }
-    create = (pthread_create_fn)dlsym(RTLD_DEFAULT, "pthread_create");
+#ifdef NM_LITE
+    (void)create;
+    (void)tid;
+    out("NM_LITE ok\n", 11);
+#else
+    /* direct weak reference first: dlsym(RTLD_DEFAULT, ...) from a dlopen()ed
+     * object lands on 0 on this firmware; the weak call resolves through the
+     * DT_NEEDED libc.so.6 and works both for preload and dlopen */
+    if (pthread_create)
+        create = pthread_create;
+    else
+        create = (pthread_create_fn)dlsym(RTLD_DEFAULT, "pthread_create");
     if (!create) {
         out("NM_NO_PTHREAD\n", 14);
         return;
@@ -3439,6 +3450,7 @@ __attribute__((constructor)) static void menu_overlay_init(void)
     } else {
         out("NM_WORKER_FAIL\n", 15);
     }
+#endif
 }
 
 
