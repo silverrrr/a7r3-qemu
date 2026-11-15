@@ -53,6 +53,9 @@ extern void *dlopen(const char *path, int flags) __attribute__((weak));
 
 #define CLOCK_MONOTONIC 1
 #define O_APPEND_CREAT 0x441
+/* one file per boot: the log is truncated when this process opens it, so
+ * "tail /tmp/newmenu.log" always describes the current run */
+#define O_TRUNC_CREAT 0x241
 
 struct timespec32 {
     long tv_sec;
@@ -109,7 +112,7 @@ static int log_open(void)
 {
     if (g_log >= 0)
         return g_log;
-    g_log = (int)sys3(SYS_open, (long)"/tmp/newmenu.log", O_APPEND_CREAT, 0644);
+    g_log = (int)sys3(SYS_open, (long)"/tmp/newmenu.log", O_TRUNC_CREAT, 0644);
     return g_log;
 }
 
@@ -375,104 +378,554 @@ struct props {
     int count;
 };
 
-/* Setting nodes per category page (6 rows each).  All names are exported by
- * CautionConfig.so; anything that does not resolve falls back to the baked
- * caption and a "0/0" value, so a wrong guess never breaks the menu. */
+static int pm_readable(const void *p, unsigned len);
+/* ------------------------------------------------------------------ */
+/* complete menu: enumerate every setting node at run time              */
+/*                                                                     */
+/* CautionConfig.so exports 456 cmnViewSettingNodeRoot* objects (all in */
+/* .bss, so dlsym() returns the node itself).  Instead of a hard-coded  */
+/* 48-item table we parse the already-loaded ELF's dynamic symbol table */
+/* in memory: that needs no symbol names in this payload and stays       */
+/* correct if the firmware ever changes.                                */
+/* ------------------------------------------------------------------ */
+
 #define CAT_COUNT 8
 #define ROW_COUNT 6
+#define MAX_ITEMS 512
+#define SYM_PREFIX "cmnViewSettingNodeRoot"
 
-static const char *const g_cat_syms[CAT_COUNT][ROW_COUNT] = {
-    /* 0: image quality (the original demo page) */
-    { "cmnViewSettingNodeRootRawFileType",
-      "cmnViewSettingNodeRootStlImageJPEGQuality",
-      "cmnViewSettingNodeRootStillImageSize",
-      "cmnViewSettingNodeRootStlImageAspectRatio",
-      "cmnViewSettingNodeRootStillPanoramaImageSize",
-      "cmnViewSettingNodeRootStlImageQuality" },
-    /* 1: common / power & display */
-    { "cmnViewSettingNodeRootAutoPowerOffTemp",
-      "cmnViewSettingNodeRootTouchOperation",
-      "cmnViewSettingNodeRootSetupCleaningMode",
-      "cmnViewSettingNodeRootSettingSetupNtscPalSEL",
-      "cmnViewSettingNodeRootAutoMonitorOff",
-      "cmnViewSettingNodeRootBeep" },
-    /* 2: shooting */
-    { "cmnViewSettingNodeRootSilentShutter",
-      "cmnViewSettingNodeRootSteadyShot",
-      "cmnViewSettingNodeRootZebra",
-      "cmnViewSettingNodeRootPeakingSettings",
-      "cmnViewSettingNodeRootCustomGridLine",
-      "cmnViewSettingNodeRootAudioMode" },
-    /* 3: playback */
-    { "cmnViewSettingNodeRootPlaybackDisplay",
-      "cmnViewSettingNodeRootGroupingDisplay",
-      "cmnViewSettingNodeRootMemoryCardDisplayCardSpace",
-      "cmnViewSettingNodeRootCopy",
-      "cmnViewSettingNodeRootAutoImageExtract",
-      "cmnViewSettingNodeRootWriteDate" },
-    /* 4: movie */
-    { "cmnViewSettingNodeRootMovieFileFormat",
-      "cmnViewSettingNodeRootMovieRecordingSetting",
-      "cmnViewSettingNodeRootMovieExpoMode",
-      "cmnViewSettingNodeRootMovieAudioRecord",
-      "cmnViewSettingNodeRootMovieSteadyShot",
-      "cmnViewSettingNodeRootFrameRateZako" },
-    /* 5: network */
-    { "cmnViewSettingNodeRootAccessPoint",
-      "cmnViewSettingNodeRootBluetoothSetting",
-      "cmnViewSettingNodeRootAirplaneMode",
-      "cmnViewSettingNodeRootWlPowerSave",
-      "cmnViewSettingNodeRootControlWithSmartPhone",
-      "cmnViewSettingNodeRootDisplayMACAddress" },
-    /* 6: setup / system */
-    { "cmnViewSettingNodeRootSetupVersion",
-      "cmnViewSettingNodeRootSetupLanguage",
-      "cmnViewSettingNodeRootClockDateTimeSetup",
-      "cmnViewSettingNodeRootMemoryCardFormat",
-      "cmnViewSettingNodeRootCopyrightInformation",
-      "cmnViewSettingNodeRootVersion" },
-    /* 7: custom */
-    { "cmnViewSettingNodeRootCustomFunction",
-      "cmnViewSettingNodeRootCustomButtonH",
-      "cmnViewSettingNodeRootCustomDialWheelSetup",
-      "cmnViewSettingNodeRootCustomFunctionShooting",
-      "cmnViewSettingNodeRootTouchPadSettings",
-      "cmnViewSettingNodeRootDISPButtonMonitor" },
+struct menu_item {
+    struct node *node;
+    const char *name;              /* points into the module's strtab */
 };
 
-static void *g_caution;
-static struct node *g_nodes[CAT_COUNT][ROW_COUNT];
-static int g_nodes_tried;
+static void *g_caution;            /* CautionConfig.so handle (dlopen) */
+
+static struct menu_item g_items[MAX_ITEMS];
+static int g_item_count;
+static unsigned g_tab_first[CAT_COUNT];   /* index into g_items */
+static unsigned g_tab_items[CAT_COUNT];
+static int g_tab_error;
+
+static void log_utf8(const char *prefix, const char *s);
+/* /proc/self/maps may have been read before the firmware finished loading its
+ * libraries, so the cached ranges can be incomplete; reload them here. */
+static void pm_reload_maps(void);
+
+static const char *g_tab_name[CAT_COUNT] = {
+    "image", "general", "shooting", "playback",
+    "movie", "network", "setup", "custom"
+};
+
+static int lower_ch(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
+/* case-insensitive substring test */
+static int str_has(const char *s, const char *needle)
+{
+    int i;
+    while (s && *s) {
+        for (i = 0; needle[i]; i++)
+            if (lower_ch(s[i]) != lower_ch(needle[i]))
+                break;
+        if (!needle[i])
+            return 1;
+        s++;
+    }
+    return 0;
+}
+
+/* which of the eight tabs an item belongs to (first match wins) */
+static int str_starts(const char *s, const char *p)
+{
+    while (*p) {
+        if (lower_ch(*s) != lower_ch(*p))
+            return 0;
+        s++;
+        p++;
+    }
+    return 1;
+}
+
+static int any_starts(const char *name, const char *const *keys)
+{
+    int i;
+    for (i = 0; keys[i]; i++)
+        if (str_starts(name, keys[i]))
+            return 1;
+    return 0;
+}
+
+/* which of the eight tabs an item belongs to (first match wins) */
+static int tab_of_name(const char *name)
+{
+    static const char *const t_custom[] = {
+        "Custom", "Ctrl", "Disp", "TouchPad", "Dial", "MyMenu", "Recall", 0 };
+    static const char *const t_movie[] = {
+        "Movie", "Cinematone", "Slog", "Proxy", "FrameRate", "Audio",
+        "DualVideo", "Video", 0 };
+    static const char *const t_play[] = {
+        "Playback", "Group", "Copy", "Delete", "View", "Slide", "Rotate",
+        "Protect", "Rating", "Enlarge", "DataCode", "WriteDate", "Extract",
+        "Card", "Magnif", "CameraData", 0 };
+    static const char *const t_net[] = {
+        "Access", "Bluetooth", "Airplane", "Wl", "Wifi", "Smart", "Mac",
+        "Ftp", "Transfer", "Send", "Edit", "Remote", "PCRemote", 0 };
+    static const char *const t_setup[] = {
+        "Setup", "Version", "Language", "Clock", "Date", "Area", "Format",
+        "Reset", "Copyright", "Cert", "Device", "Calib", "Demo", "Power",
+        "AutoPower", "Beep", "Monitor", "Display", "BackLight", "Charge",
+        "Usb", "Hdmi", "Ntsc", "Pal", 0 };
+    static const char *const t_image[] = {
+        "Stl", "Still", "Raw", "Jpeg", "Image", "Aspect", "Panorama",
+        "APSC", "Creative", "Picture", "DRO", "Zoom", "Quality", "File",
+        "Color", "Lens", 0 };
+    static const char *const t_shot[] = {
+        "AF", "Af", "Focus", "Drive", "Bracket", "Meter", "Exposure", "Iso",
+        "White", "Flash", "Face", "Eye", "Zebra", "Peak", "Steady",
+        "Silent", "Interval", "Anti", "Self", "Touch", "Ael", "Aperture",
+        "Shutter", "Phase", "Mode", "Cont", "Burst", 0 };
+
+    /* names arrive as the raw symbol ("cmnViewSettingNodeRootCustomButtonH"):
+     * match against the part after the common prefix */
+    if (name && __builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) == 0)
+        name += sizeof(SYM_PREFIX) - 1;
+
+    if (any_starts(name, t_custom))
+        return 7;
+    if (any_starts(name, t_movie))
+        return 4;
+    if (any_starts(name, t_play))
+        return 3;
+    if (any_starts(name, t_net))
+        return 5;
+    if (any_starts(name, t_setup))
+        return 6;
+    if (any_starts(name, t_image))
+        return 0;
+    if (any_starts(name, t_shot))
+        return 1;
+    return 2;
+}
+
+/* base of a module as reported by /proc/self/maps: the mapping for the file
+ * with offset 0 is the one that starts at its ELF header */
+static unsigned long module_base_from_maps(const char *needle)
+{
+    static char buf[65536];
+    int fd, n;
+    char *p, *end;
+
+    fd = (int)sys3(SYS_open, (long)"/proc/self/maps", 0, 0);
+    if (fd < 0)
+        return 0;
+    n = 0;
+    while (n < (int)sizeof(buf) - 1) {
+        long r = sys3(SYS_read, fd, (long)(buf + n),
+                      (long)(sizeof(buf) - 1 - (unsigned)n));
+        if (r <= 0)
+            break;
+        n += (int)r;
+    }
+    sys2(SYS_close, fd, 0);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    p = buf;
+    end = buf + n;
+    while (p < end) {
+        char *line = p;
+        unsigned long lo = 0;
+        unsigned long off = 0;
+        char *q;
+        while (p < end && *p != '\n')
+            p++;
+        if (p < end)
+            *p = 0;
+        else
+            p = end;
+        /* start address */
+        for (q = line; *q && *q != '-'; q++) {
+            int d;
+            char c = *q;
+            if (c >= '0' && c <= '9')
+                d = c - '0';
+            else if (c >= 'a' && c <= 'f')
+                d = c - 'a' + 10;
+            else
+                break;
+            lo = (lo << 4) | (unsigned)d;
+        }
+        if (!lo)
+            continue;
+        /* skip perms, then read the file offset */
+        q = line;
+        while (*q && *q != ' ')
+            q++;
+        while (*q == ' ')
+            q++;
+        while (*q && *q != ' ')
+            q++;
+        while (*q == ' ')
+            q++;
+        for (; *q && *q != ' '; q++) {
+            int d;
+            char c = *q;
+            if (c >= '0' && c <= '9')
+                d = c - '0';
+            else if (c >= 'a' && c <= 'f')
+                d = c - 'a' + 10;
+            else
+                break;
+            off = (off << 4) | (unsigned)d;
+        }
+        if (off != 0)
+            continue;
+        if (str_has(line, needle)) {
+            log_hex("NM_base_maps=", lo);
+            return lo;
+        }
+        if (p >= end)
+            break;
+        p++;
+    }
+    return 0;
+}
+
+/* first page in [addr-4096*k] that starts with the ELF magic (fallback; skips
+ * unmapped gaps instead of stopping at them) */
+static unsigned long elf_base_of(unsigned long addr)
+{
+    unsigned long a = addr & ~0xfffUL;
+    int i;
+
+    log_hex("NM_scan_from=", a);
+    log_hex("NM_scan_rd=", (unsigned long)pm_readable((const void *)a, 8));
+    for (i = 0; i < 8192; i++, a -= 0x1000UL) {
+        unsigned magic;
+        if (a < 0x10000UL)
+            return 0;
+        if (!pm_readable((const void *)a, 8))
+            continue;
+        __builtin_memcpy(&magic, (const void *)a, 4);
+        if (magic == 0x464c457fUL) {
+            log_hex("NM_scan_hit=", a);
+            return a;
+        }
+    }
+    return 0;
+}
+
+/* walk the dynamic section of the module `base` and collect our nodes */
+static int collect_items(unsigned long base)
+{
+    const unsigned char *eh = (const unsigned char *)base;
+    unsigned e_phoff, e_phentsize, e_phnum, i, nchain = 0;
+    unsigned long dyn = 0, dyn_len = 0;
+    unsigned long symtab = 0, strtab = 0, hash = 0, strsz = 0;
+    unsigned long gnu_hash = 0;
+
+    if (!eh || !pm_readable(eh, 0x34))
+        return -1;
+    __builtin_memcpy(&e_phoff, eh + 0x1c, 4);
+    __builtin_memcpy(&e_phentsize, eh + 0x2a, 2);
+    __builtin_memcpy(&e_phnum, eh + 0x2c, 2);
+    if (e_phnum > 64 || e_phentsize < 32)
+        return -2;
+    for (i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = eh + e_phoff + i * e_phentsize;
+        unsigned type, vaddr, memsz;
+        if (!pm_readable(ph, 32))
+            return -3;
+        __builtin_memcpy(&type, ph + 0, 4);
+        __builtin_memcpy(&vaddr, ph + 8, 4);
+        __builtin_memcpy(&memsz, ph + 20, 4);
+        if (type == 2) {                        /* PT_DYNAMIC */
+            dyn = base + vaddr;
+            dyn_len = memsz;
+            break;
+        }
+    }
+    if (!dyn || !pm_readable((const void *)dyn, (unsigned)dyn_len))
+        return -4;
+    for (i = 0; i + 8 <= dyn_len; i += 8) {
+        unsigned tag, val;
+        __builtin_memcpy(&tag, (const void *)(dyn + i), 4);
+        __builtin_memcpy(&val, (const void *)(dyn + i + 4), 4);
+        if (tag == 0)                            /* DT_NULL */
+            break;
+        switch (tag) {
+        case 4:  hash = val; break;              /* DT_HASH */
+        case 5:  strtab = val; break;            /* DT_STRTAB */
+        case 6:  symtab = val; break;            /* DT_SYMTAB */
+        case 10: strsz = val; break;             /* DT_STRSZ */
+        case 0x6ffffef5UL: gnu_hash = val; break;/* DT_GNU_HASH */
+        default: break;
+        }
+    }
+    if (symtab && symtab < 0x10000UL)
+        symtab += base;
+    if (strtab && strtab < 0x10000UL)
+        strtab += base;
+    if (hash && hash < 0x10000UL)
+        hash += base;
+    if (gnu_hash && gnu_hash < 0x10000UL)
+        gnu_hash += base;
+    /* the loader usually relocates these to absolute addresses; if the value
+     * only makes sense with the module base, use that instead */
+    if (symtab && !pm_readable((const void *)symtab, 16) &&
+        pm_readable((const void *)(base + symtab), 16))
+        symtab += base;
+    if (strtab && !pm_readable((const void *)strtab, 8) &&
+        pm_readable((const void *)(base + strtab), 8))
+        strtab += base;
+    if (!symtab || !strtab)
+        return -5;
+
+    if (hash && pm_readable((const void *)hash, 8)) {
+        __builtin_memcpy(&nchain, (const void *)(hash + 4), 4);
+    } else if (gnu_hash && pm_readable((const void *)gnu_hash, 16)) {
+        /* GNU hash: walk the buckets to the highest symbol, then follow its
+         * chain to the end (low bit set on the last entry) -- the estimate
+         * nbuckets+symoffset+64 stops early and loses symbols */
+        unsigned nbuckets, symoffset, bloom_size;
+        __builtin_memcpy(&nbuckets, (const void *)gnu_hash, 4);
+        __builtin_memcpy(&symoffset, (const void *)(gnu_hash + 4), 4);
+        __builtin_memcpy(&bloom_size, (const void *)(gnu_hash + 8), 4);
+        if (nbuckets < 65536u && bloom_size < 65536u) {
+            unsigned long buckets = gnu_hash + 16 + (unsigned long)bloom_size * 4;
+            unsigned long chain = buckets + (unsigned long)nbuckets * 4;
+            unsigned max_sym = 0, k;
+            for (k = 0; k < nbuckets; k++) {
+                unsigned b;
+                if (!pm_readable((const void *)(buckets + k * 4), 4))
+                    break;
+                __builtin_memcpy(&b, (const void *)(buckets + k * 4), 4);
+                if (b > max_sym)
+                    max_sym = b;
+            }
+            if (max_sym >= symoffset) {
+                for (;;) {
+                    unsigned c;
+                    unsigned long o = chain + (unsigned long)(max_sym - symoffset) * 4;
+                    if (!pm_readable((const void *)o, 4))
+                        break;
+                    __builtin_memcpy(&c, (const void *)o, 4);
+                    max_sym++;
+                    if (c & 1u)
+                        break;
+                    if (max_sym > 200000u)
+                        break;
+                }
+            }
+            nchain = max_sym;
+        }
+    }
+    if (nchain < 8 || nchain > 65536)
+        nchain = 4096;
+
+    for (i = 1; i < nchain && g_item_count < MAX_ITEMS; i++) {
+        const unsigned char *sym = (const unsigned char *)(symtab + i * 16);
+        unsigned st_name, st_value;
+        const char *name;
+        unsigned long node_addr;
+        unsigned vptr;
+        int k, nul = 0, bad = 0;
+
+        if (!pm_readable(sym, 16))
+            break;
+        __builtin_memcpy(&st_name, sym + 0, 4);
+        __builtin_memcpy(&st_value, sym + 4, 4);
+        if (!st_name || !st_value)
+            continue;
+        if (strsz && st_name >= strsz)
+            continue;
+        name = (const char *)(strtab + st_name);
+        if (!pm_readable(name, 8))
+            continue;
+        /* the name has to be a short printable C string inside this module */
+        for (k = 0; k < 96; k++) {
+            char c;
+            if (!pm_readable(name + k, 1)) {
+                bad = 1;
+                break;
+            }
+            c = name[k];
+            if (!c) {
+                nul = 1;
+                break;
+            }
+            if (c < 0x20 || c > 0x7e) {
+                bad = 1;
+                break;
+            }
+        }
+        if (bad || !nul)
+            continue;
+        if (__builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) != 0)
+            continue;
+        /* the object itself must be readable and start with a plausibly
+         * relocated vtable pointer -- otherwise a bad st_value would hand us a
+         * garbage node that crashes the app later, when the menu draws it.
+         * dlsym() is authoritative here: it returns the address the loader
+         * actually bound, so we never have to trust our own st_value math. */
+        {
+            void *sym_addr = g_caution ? dlsym(g_caution, name) : NULL;
+            if (!sym_addr)
+                continue;
+            node_addr = (unsigned long)sym_addr;
+        }
+        if (!pm_readable((const void *)node_addr, sizeof(struct node)))
+            continue;
+        __builtin_memcpy(&vptr, (const void *)node_addr, 4);
+        if (!plausible((const void *)(unsigned long)vptr))
+            continue;
+        {
+            /* `count` must look like an option count and the children array has
+             * to be readable: this filters out any symbol whose address is not
+             * really a node (which would crash the menu later) */
+            void *children = NULL;
+            int count = 0;
+            int c2;
+            __builtin_memcpy(&children, (const void *)(node_addr + 4), 4);
+            __builtin_memcpy(&count, (const void *)(node_addr + 8), 4);
+            if (count < 0 || count > 200)
+                continue;
+            if (count > 0 && !pm_readable(children, (unsigned)count * 4u))
+                continue;
+            /* every child has to be a readable node as well */
+            for (c2 = 0; c2 < count; c2++) {
+                unsigned long cp = 0;
+                __builtin_memcpy(&cp, (const void *)((const char *)children + c2 * 4), 4);
+                if (!plausible((const void *)cp) ||
+                    !pm_readable((const void *)cp, sizeof(struct node)))
+                    break;
+            }
+            if (count > 0 && c2 < count)
+                continue;
+        }
+        g_items[g_item_count].name = name;
+        g_items[g_item_count].node = (struct node *)node_addr;
+        g_item_count++;
+    }
+    return g_item_count;
+}
+
+static void sort_items_by_name(void)
+{
+    int i, j;
+    for (i = 1; i < g_item_count; i++) {
+        struct menu_item key = g_items[i];
+        for (j = i - 1; j >= 0; j--) {
+            const char *a = g_items[j].name, *b = key.name;
+            int cmp = 0;
+            while (*a && *b && *a == *b) {
+                a++;
+                b++;
+            }
+            cmp = (int)(unsigned char)*a - (int)(unsigned char)*b;
+            if (cmp <= 0)
+                break;
+            g_items[j + 1] = g_items[j];
+        }
+        g_items[j + 1] = key;
+    }
+}
+
+static void build_tabs(void)
+{
+    static struct menu_item src[MAX_ITEMS];
+    int i, tab;
+    unsigned n[CAT_COUNT], off[CAT_COUNT], cur[CAT_COUNT], pos;
+
+    sort_items_by_name();
+    for (i = 0; i < g_item_count; i++)
+        src[i] = g_items[i];              /* distribute from a copy: we write
+                                             into g_items below */
+    for (i = 0; i < CAT_COUNT; i++)
+        n[i] = 0;
+    for (i = 0; i < g_item_count; i++) {
+        tab = tab_of_name(src[i].name);
+        n[tab]++;
+    }
+    for (i = 0, pos = 0; i < CAT_COUNT; i++) {
+        off[i] = pos;
+        cur[i] = 0;
+        pos += n[i];
+    }
+    for (i = 0; i < g_item_count; i++) {
+        tab = tab_of_name(src[i].name);
+        g_items[off[tab] + cur[tab]] = src[i];
+        cur[tab]++;
+    }
+    for (i = 0; i < CAT_COUNT; i++) {
+        g_tab_first[i] = off[i];
+        g_tab_items[i] = n[i];
+    }
+}
 
 static void resolve_nodes(void)
 {
-    int c, i, found = 0;
-    if (g_nodes_tried)
+    unsigned long base = 0;
+    int rc, i;
+
+    if (g_item_count || g_tab_error)
         return;
-    g_nodes_tried = 1;
     if (!dlopen || !dlsym) {
         out("NM_NO_DL\n", 9);
+        g_tab_error = 1;
         return;
     }
+    pm_reload_maps();
     g_caution = dlopen("/usr/lib/CautionConfig.so", 5 /* RTLD_LAZY|RTLD_NOLOAD */);
     log_hex("NM_caution=", (unsigned long)g_caution);
-    for (c = 0; c < CAT_COUNT; c++) {
-        for (i = 0; i < ROW_COUNT; i++) {
-            g_nodes[c][i] = g_caution
-                ? (struct node *)dlsym(g_caution, g_cat_syms[c][i]) : NULL;
-            if (g_nodes[c][i])
-                found++;
-        }
+    if (!g_caution) {
+        out("NM_FAIL caution\n", 16);
+        g_tab_error = 1;
+        return;
     }
-    log_hex("NM_nodes_found=", (unsigned long)found);
-    log_hex("NM_node0=", (unsigned long)g_nodes[0][0]);
+    {
+        void *any = dlsym(g_caution, "cmnViewSettingNodeRoot24pMode");
+        log_hex("NM_sym_any=", (unsigned long)any);
+        base = module_base_from_maps("CautionConfig.so");
+        if (!base && any)
+            base = elf_base_of((unsigned long)any);
+    }
+    log_hex("NM_elf_base=", base);
+    if (!base) {
+        out("NM_FAIL base\n", 13);
+        g_tab_error = 1;
+        return;
+    }
+    rc = collect_items(base);
+    log_hex("NM_items=", (unsigned long)rc);
+    if (rc <= 0) {
+        out("NM_FAIL items\n", 14);
+        g_tab_error = 1;
+        return;
+    }
+    build_tabs();
+    for (i = 0; i < CAT_COUNT; i++) {
+        log_hex("NM_tab=", (unsigned long)i);
+        log_hex("  first=", (unsigned long)g_tab_first[i]);
+        log_hex("  count=", (unsigned long)g_tab_items[i]);
+    }
+    log_utf8("NM_item0 ", g_items[0].name);
+    log_utf8("NM_itemN ", g_items[g_item_count - 1].name);
 }
 
-static unsigned g_category;
-static unsigned g_selection;
+/* ------------------------------------------------------------------ */
+/* paged view                                                          */
+/* ------------------------------------------------------------------ */
+
+static unsigned g_category;      /* tab 0..7 */
+static unsigned g_page;          /* page inside the tab (0-based) */
+static unsigned g_selection;     /* row 0..5 inside the page */
 static int g_open;   /* 1 = overlay visible (toggled by tap / web) */
 static int g_dirty;  /* repaint on the next 20 ms beat */
-static int g_page;   /* 0 = setting list, 1 = option popup (2nd level) */
+static int g_popup;  /* 1 = option popup (2nd level) is open */
 
 /* After we hand the screen back, the native UI repaints its view.  Writing
  * into its buffers during that repaint is what crashed the guest before, so
@@ -489,13 +942,51 @@ static int paint_paused(void)
     return g_pause_until && mono_sec() <= g_pause_until;
 }
 
+static unsigned tab_pages(unsigned tab)
+{
+    if (tab >= CAT_COUNT || !g_tab_items[tab])
+        return 1;
+    return (g_tab_items[tab] + ROW_COUNT - 1) / ROW_COUNT;
+}
+
+static unsigned page_count(void)
+{
+    return tab_pages(g_category % CAT_COUNT);
+}
+
+static struct menu_item *item_at(unsigned tab, unsigned page, unsigned row)
+{
+    unsigned idx;
+    if (tab >= CAT_COUNT)
+        return NULL;
+    idx = g_tab_first[tab] + page * ROW_COUNT + row;
+    if (idx >= g_tab_first[tab] + g_tab_items[tab] || idx >= (unsigned)g_item_count)
+        return NULL;
+    return &g_items[idx];
+}
+
 /* currently displayed row */
 static struct node *cur_node(unsigned row)
 {
-    unsigned c = g_category % CAT_COUNT;
-    if (row >= ROW_COUNT)
-        row = 0;
-    return g_nodes[c][row];
+    struct menu_item *it = item_at(g_category % CAT_COUNT, g_page, row);
+    if (!it && g_page)
+        it = item_at(g_category % CAT_COUNT, 0, row);
+    return it ? it->node : NULL;
+}
+
+static const char *cur_name(unsigned row)
+{
+    struct menu_item *it = item_at(g_category % CAT_COUNT, g_page, row);
+    return it ? it->name : NULL;
+}
+
+/* flatten the module symbol name for the fallback caption:
+ * cmnViewSettingNodeRootStillImageSize -> StillImageSize */
+static const char *item_short_name(const char *sym)
+{
+    if (!sym)
+        return NULL;
+    return sym + (sizeof(SYM_PREFIX) - 1);
 }
 
 static void draw_number(int x, int y, unsigned value, unsigned total,
@@ -568,6 +1059,42 @@ static void log_utf8(const char *prefix, const char *s)
     out(s, n);
     out("\n", 1);
 }
+
+
+static void page_step(int dir)
+{
+    unsigned pages = page_count();
+    int p = (int)g_page + dir;
+
+    if (p < 0)
+        p = (int)pages - 1;
+    if (p >= (int)pages)
+        p = 0;
+    g_page = (unsigned)p;
+    if (g_selection >= ROW_COUNT)
+        g_selection = 0;
+    g_dirty = 1;
+    log_hex("NM_PAGE=", (unsigned long)g_page);
+}
+
+static void tab_step(int dir)
+{
+    int t = (int)(g_category % CAT_COUNT), i;
+
+    for (i = 0; i < CAT_COUNT; i++) {
+        t = (t + dir + CAT_COUNT) % CAT_COUNT;
+        if (g_tab_items[t])
+            break;
+    }
+    g_category = (unsigned)t;
+    g_page = 0;
+    g_selection = 0;
+    g_popup = 0;
+    g_dirty = 1;
+    log_hex("NM_TAB=", (unsigned long)g_category);
+}
+
+static unsigned page_count(void);
 
 /* --- apply a value through the firmware's own API ---------------------
  *
@@ -781,7 +1308,7 @@ static void popup_open(void)
     struct node *n = cur_node(g_selection);
     int i, cur_idx = -1, sr;
 
-    g_page = 1;
+    g_popup = 1;
     g_dirty = 1;
     g_opt_total = n ? (unsigned)n->count : 0;
     if (!n || n->count <= 0) {
@@ -900,7 +1427,7 @@ static void popup_apply(int idx)
     /* refresh the list row behind the popup, then go back to it */
     for (i = 0; i < POPUP_OPTS; i++)
         g_opt_sr[i] = 0;
-    g_page = 0;
+    g_popup = 0;
     g_dirty = 1;
 }
 
@@ -1006,8 +1533,8 @@ static void nm_back(void)
 {
     if (!g_open)
         return;
-    if (g_page) {
-        g_page = 0;
+    if (g_popup) {
+        g_popup = 0;
         say("NM_BACK popup\n", 14);
     } else {
         overlay_close(1);
@@ -1030,10 +1557,38 @@ static void build_frame(void)
         sprite(4 + i * 58, 2, s);
     }
 
-    /* header title + page counter */
+    /* header: title, page arrows, "<page>/<pages> <items>项" */
     rect((struct box){ 0, 56, MENU_W, 44 }, 0x111f);
-    text_top(20, 64, TITLE_MY_MENU, 0xdddf);
-    draw_number(MENU_W - 76, 62, g_category + 1u, CAT_COUNT, 0xdddf);
+    text_top(62, 64, TITLE_MY_MENU, 0xdddf);
+    if (page_count() > 1) {
+        int k;
+        /* "<" */
+        for (k = 0; k < 9; k++) {
+            rect((struct box){ 24 + k, 70 - k, 2, 2 }, 0xdddf);
+            rect((struct box){ 24 + k, 70 + k, 2, 2 }, 0xdddf);
+        }
+        /* ">" */
+        for (k = 0; k < 9; k++) {
+            rect((struct box){ MENU_W - 30 - k, 70 - k, 2, 2 }, 0xdddf);
+            rect((struct box){ MENU_W - 30 - k, 70 + k, 2, 2 }, 0xdddf);
+        }
+    }
+    draw_number(MENU_W - 100, 62, g_page + 1u, page_count(), 0xdddf);
+    {
+        char b[32];
+        int n = 0;
+        unsigned v = g_tab_items[g_category % CAT_COUNT];
+        if (!v)
+            v = 0;
+        b[n++] = ' ';
+        if (v >= 100u)
+            b[n++] = (char)('0' + (v / 100u) % 10u);
+        if (v >= 10u)
+            b[n++] = (char)('0' + (v / 10u) % 10u);
+        b[n++] = (char)('0' + v % 10u);
+        b[n++] = 0;
+        text_top(MENU_W - 156, 64, b, 0x889f);
+    }
 
     /* rows */
     for (i = 0; i < ROW_COUNT; i++) {
@@ -1056,18 +1611,29 @@ static void build_frame(void)
             }
         }
 
-        if (title)
+        if (title) {
             text_top(24, row.y + 12, title, color);
-        else
-            label(24, row.y + 12, &ov_labels[g_rows[g_category & 7u][i]], color);
+        } else {
+            const char *short_name = item_short_name(cur_name((unsigned)i));
+            if (short_name && *short_name)
+                text_top(24, row.y + 12, short_name, color);
+            else
+                label(24, row.y + 12,
+                      &ov_labels[g_rows[g_category & 7u][i]], color);
+        }
 
         if (value) {
             text_right(MENU_W - 48, row.y + 12, value, color);
         } else if (cnt > 0) {
-            draw_number(MENU_W - 170, row.y + 12, sel + 1u, cnt, color);
+            /* `selected` is already an SR (1-based): show it as is */
+            unsigned shown = sel ? sel : 1u;
+            if (shown > cnt)
+                shown = cnt;
+            draw_number(MENU_W - 170, row.y + 12, shown, cnt, color);
         } else {
-            draw_number(MENU_W - 170, row.y + 12, 0u, 0u,
-                        selected ? 0xffff : 0x88af);
+            /* no options at all: an action row */
+            text_right(MENU_W - 48, row.y + 12, "-",
+                       selected ? 0xffff : 0x88af);
         }
         /* ">": this row opens a second level */
         if (cnt > 0) {
@@ -1090,7 +1656,7 @@ static void build_frame(void)
     /* footer + the old/new switch button in the top-right corner */
     text_top(MENU_W - 190, MENU_H - 40, FOOTER_CLOSE, 0xdddf);
     draw_switch_icon(SW_BTN_X, SW_BTN_Y, 1);
-    if (g_page)
+    if (g_popup)
         popup_draw();
 }
 
@@ -1531,6 +2097,7 @@ static void overlay_open(void)
     g_open = 1;
     g_selection = 0;
     g_page = 0;
+    g_popup = 0;
     g_dirty = 1;
     g_have_last = 0;          /* the panel is native content again: no gate */
     say("NM_OPEN\n", 8);
@@ -1590,11 +2157,11 @@ static void native_kick(void)
 static void overlay_close(int restore)
 {
     if (!g_open) {
-        g_page = 0;
+        g_popup = 0;
         return;
     }
     g_open = 0;
-    g_page = 0;
+    g_popup = 0;
     g_dirty = 1;
     if (restore) {
         if (g_saved_ok && g_native_sum != 0)
@@ -1715,7 +2282,7 @@ static void handle_touch(int x, int y)
         /* anything else on the native screen belongs to the native UI */
         return;
     }
-    if (g_page) {                        /* option popup is modal */
+    if (g_popup) {                        /* option popup is modal */
         struct box box;
         int rows = (int)g_opt_total - g_opt_first + 1;
         if (rows < 1)
@@ -1752,10 +2319,23 @@ static void handle_touch(int x, int y)
         nm_back();
         return;
     }
+    if (y >= 56 && y < 100) {           /* header strip: page back / forward */
+        if (x < 60) {
+            page_step(-1);
+            return;
+        }
+        if (x > MENU_W - 60) {
+            page_step(1);
+            return;
+        }
+    }
     if (y < 56) {                       /* category strip */
         row = x / 58;
         if (row >= 0 && row < 8) {
             g_category = (unsigned)row;
+            g_page = 0;
+            g_selection = 0;
+            g_popup = 0;
             g_dirty = 1;
             log_hex("NM_TAP cat=", (unsigned long)row);
         }
@@ -2062,8 +2642,8 @@ static int flip_guard(void)
      * overlay owns the screen and nothing we just did explains a present, that
      * present means a native key was pressed -> act as "back". */
     if (g_open && (now_ms() - g_last_tap_ms) > 1500u) {
-        if (g_page) {
-            g_page = 0;
+        if (g_popup) {
+            g_popup = 0;
             g_last_tap_ms = now_ms();        /* absorb the follow-up frames */
             say("NM_NATIVE_BACK page\n", 21);
             g_dirty = 1;
@@ -2276,25 +2856,30 @@ static void poll_key(void)
     sys3(SYS_unlink, (long)"/tmp/nm_key", 0, 0);
     switch (buf[0]) {
     case 'u':
-        if (g_open && g_page)
+        if (g_open && g_popup)
             popup_move(-1);
         else
             g_selection = (g_selection + ROW_COUNT - 1u) % ROW_COUNT;
         g_dirty = 1;
         break;
     case 'd':
-        if (g_open && g_page)
+        if (g_open && g_popup)
             popup_move(1);
         else
             g_selection = (g_selection + 1u) % ROW_COUNT;
         g_dirty = 1;
         break;
-    case 'c':
-        g_category = (g_category + 1u) & 7u;
-        g_dirty = 1;
+    case 'c':                      /* next non-empty tab */
+        tab_step(1);
+        break;
+    case 'j':                      /* next page */
+        page_step(1);
+        break;
+    case 'k':                      /* previous page */
+        page_step(-1);
         break;
     case 'e':                      /* apply: step the value forward */
-        if (g_open && g_page)
+        if (g_open && g_popup)
             popup_apply(g_opt_hover);
         else
             commit_step(1);
@@ -2306,7 +2891,7 @@ static void poll_key(void)
         break;
     case 'n':                      /* open the second level of this row */
         if (g_open) {
-            if (g_page)
+            if (g_popup)
                 popup_apply(g_opt_hover);
             else
                 popup_open();
@@ -2510,6 +3095,15 @@ static void pm_load_maps(void)
         }
         p = next;
     }
+}
+
+/* drop the cached ranges and read /proc/self/maps again */
+static void pm_reload_maps(void)
+{
+    g_rng_loaded = 0;
+    g_rng_n = 0;
+    pm_load_maps();
+    log_hex("NM_maps_ranges=", (unsigned long)g_rng_n);
 }
 
 static int pm_readable(const void *p, unsigned len)

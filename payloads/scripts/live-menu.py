@@ -171,8 +171,11 @@ class Handler(SimpleHTTPRequestHandler):
             time.sleep(max(1.0, min(wait, 30.0)))
             out = bytes((self.session.console or b"")[base:]).decode(
                 "latin-1", "replace")
-            # drop the echoed command line and the prompt noise around it
-            lines = [ln for ln in out.splitlines() if not ln.startswith("NM_")]
+            # drop the periodic overlay noise, keep everything else (NM_* lines
+            # are often exactly what we are debugging)
+            noise = ("NM_OVERLAY", "NM_FLIP", "NM_KEYREAD", "NM_REPRESENT")
+            lines = [ln for ln in out.splitlines()
+                     if not ln.startswith(noise)]
             self._json({"ok": ok, "out": "\n".join(lines)[-6000:]})
             return
         if u.path == "/nmtoggle":
@@ -189,7 +192,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if u.path == "/nmkey":
             c = (parse_qs(u.query).get("c") or [""])[0][:1].lower()
-            if c in ("u", "d", "e", "p", "c", "l", "t", "s", "b", "n", "o", "x"):
+            if c in ("u", "d", "e", "p", "c", "l", "t", "s", "b", "n", "o", "x",
+                     "j", "k"):
                 # write then rename: the overlay may open the file the instant it
                 # appears, so it must never see a half-written (empty) file
                 ok = self.session.send(
@@ -709,7 +713,11 @@ def main():
                 pump(8.0)
 
         started = time.time()
-        stdin_ok = True
+        try:
+            select.select([sys.stdin], [], [], 0)
+            stdin_ok = True
+        except (OSError, ValueError):
+            stdin_ok = False
         while True:
             if args.duration and time.time() - started > args.duration:
                 print("[*] duration reached", flush=True)
@@ -720,7 +728,11 @@ def main():
             if not stdin_ok:
                 pump(0.2)
                 continue
-            r, _, _ = select.select([sys.stdin], [], [], 1.0)
+            try:
+                r, _, _ = select.select([sys.stdin], [], [], 1.0)
+            except (OSError, ValueError):
+                stdin_ok = False
+                continue
             if not r:
                 pump(0.2)
                 continue

@@ -101,6 +101,10 @@ App 绘制 → Sugilite 2D 命令表（(op<<16)|0xf000，0x0112=目标面）
   所以打开前要把 `0x202E0200` 的 640×480 抓下来，关闭时回写（+ 右上角小按钮）。
 - 想抓物理 MENU 键不要去 patch 输入函数（热路径 8 字节补丁会撕裂，guest 直接
   掉进 Exception shell）；改用"叠层开着时 App 又 present 了"这个只读信号当返回。
+- **完整菜单不是手写表**：`CautionConfig.so` 导出 456 个 `cmnViewSettingNodeRoot*`，
+  运行时解析 ELF 动态符号表枚举出来，节点地址用 `dlsym(name)` 拿（不要自己算
+  `st_value`，偶发垃圾指针会把 App 打崩），再按前缀分 8 个页签、每页 6 行分页。
+  GNU hash 的符号数必须走 chain 到链尾，用 `nbuckets+symoffset` 估会少一半。
 - 原生菜单是**按键式**的（触摸只管对焦），网页点击要由宿主翻译成按键；
   否则点了旧菜单毫无反应。
 - **"画面上没有"不等于"App 没画"**：App 是双缓冲 present，某些视图只画在其中

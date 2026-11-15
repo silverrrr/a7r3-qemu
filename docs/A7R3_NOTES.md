@@ -5527,5 +5527,86 @@ DOWN + ENTER（原生菜单）
 - "画面上没有" ≠ "App 没画"。多缓冲/多 surface 的机器上，先确认自己看的是哪一块。
 - 反过来也一样：报"黑屏"之前，先 dump 另外几块，再怀疑代码。
 
+## 65) ★ 完整菜单：运行时枚举全部 456 个设置节点（2026-11-15）
 
+目标：新 UI 不再是"8 分类 × 6 行 = 48 个示例项"，而是**相机上的全部设置**。
 
+### 65.1 为什么不用静态表
+
+`CautionConfig.so` 导出 **456 个** `cmnViewSettingNodeRoot*`（`nm -D` 可数），
+全是 `.bss` 里的对象（`dlsym` 返回的就是节点本身）。手写 456 个符号名既笨又
+会随固件版本漂移，所以改成**运行时从已加载的 ELF 里枚举**。
+
+### 65.2 实现（`menu_overlay.c` 里约 250 行）
+
+```
+1. 模块基址：读 /proc/self/maps，找 path 含 "CautionConfig.so" 且 offset==0 的
+   那个 mapping（失败时退回"从符号地址向下扫 ELF magic"，允许跨过空洞）。
+2. 解析 ELF32：e_phoff/e_phnum → PT_DYNAMIC → DT_SYMTAB/DT_STRTAB/DT_HASH
+   或 DT_GNU_HASH。
+3. 符号数：有 DT_HASH 用 hash[1]；只有 GNU hash 时按标准算法走
+   buckets → 最大符号 → chain 到链尾（低位=1 结束）。**不能**用
+   nbuckets+symoffset 估，会少一半（实测 235 vs 456）。
+4. 过滤：name 必须是 96 字节内的可打印 C 串；节点地址用
+   **dlsym(g_caution, name)** 拿（权威、免自算 st_value），再校验
+   vptr 可读、count ∈ [0,200]、children 数组可读、每个 child 可读。
+5. 排序 + 分桶：按名字排序，再按"前缀规则"分到 8 个页签，连续存放。
+```
+
+前缀规则（`tab_of_name`，先剥掉 `cmnViewSettingNodeRoot` 前缀）：
+custom(7) / movie(4) / playback(3) / network(5) / setup(6) / image(0) /
+general(1)，都不匹配的落到 shooting(2)。实测分布：
+
+```
+tab0 image    54   tab4 movie    25
+tab1 general  89   tab5 network  16
+tab2 shooting 150  tab6 setup    43
+tab3 playback 23   tab7 custom   56     合计 456
+```
+
+### 65.3 分页与交互
+
+- 每页 6 行；页签内页数 = `ceil(items/6)`（shooting 是 25 页）。
+- 标题栏：`◀ 我的菜单    <该页签项数>  <页>/<页数> ▶`
+- 点标题栏左/右 60 px = 上一页/下一页；`j`/`k` 同样；`c` 切下一个非空页签；
+  点顶部图标条 = 直接切页签（并复位页码与选中行）。
+- 行值：有选项的走 `getSRNumByIndex` + `children[i-1]` 取文案；没有选项的动作行
+  显示 `-`（以前是误导性的 `0/0`）。
+- 二级页（选项弹窗）、设值、present 守卫、交还屏幕都沿用 §62–64。
+
+### 65.4 实测（QEMU）
+
+```
+NM_items=0x1c8            （456）
+NM_tab=0x0 first=0x0   count=0x36   (54)
+...
+NM_tab=0x7 first=0x190 count=0x38   (56)
+```
+
+| 截图 | 内容 |
+| --- | --- |
+| `shots/fn1-home.png` | image 页签 1/9，54 项：拍摄/APS-C/创意风格/DRO… |
+| `shots/fn2-shot.png` | shooting 页签 1/25，150 项 |
+| `shots/fn3-arrow.png` | 点标题栏右侧箭头 → 2/25，行内容随之变化 |
+| `shots/gm9-popup.png` / `gm9-applied.png` | 二级页选 高 → 行值变 高（端到端设值） |
+
+### 65.5 踩到的坑
+
+1. **maps 缓存过期**：`pm_load_maps()` 可能在固件把库映射完之前就被调用，
+   缓存的区间不含 CautionConfig → 所有 `pm_readable` 判假 → 枚举 0 项。
+   修：枚举前 `pm_reload_maps()` 重新读一次（`NM_maps_ranges=0x178`）。
+2. **GNU hash 估符号数**：用 `nbuckets+symoffset+64` 只能拿到 235 个。
+3. **st_value 不可信**：切到 `dlsym(name)` 拿地址后，还要校验 vptr/count/
+   children/子节点，否则偶发把垃圾指针当节点 → 画菜单时把 App 打崩
+   （表现为 guest 掉进 `Exception>`，很容易误判成"启动竞态"）。
+4. **日志会被多轮追加**：`/tmp/newmenu.log` 改成**每次启动 O_TRUNC**，
+   否则看到的全是前面几次启动的行，排查时被误导过一次。
+5. **前缀匹配**：一开始用子串匹配（"Ratio" 命中 "Dura**ratio**n"），
+   改成"剥前缀 + 前缀匹配"后才合理。
+
+### 65.6 还没做
+
+- 页签归属仍是**前缀启发式**，不是原生 `viewSettingMenu` 的分页数据；同一设置
+  在原生可能出现在多个页签（本项目只放一个）。
+- 少量行重复（不同符号但同一 resid，例如"全景：方向"出现两次）。
+- 真机上 456 项的枚举耗时、点击响应还没量（QEMU 里一帧 1–3 s 是软件渲染的锅）。
