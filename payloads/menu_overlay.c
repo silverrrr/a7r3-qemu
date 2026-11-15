@@ -3161,7 +3161,7 @@ static long present_wrapper(long a, long b, long c, long d);
 
 static void find_surface(void)
 {
-    dlopen_fn2 dop = (dlopen_fn2)dlsym(RTLD_DEFAULT, "dlopen");
+    dlopen_fn2 dop = (dlopen_fn2)dlopen;
     void *obj;
     eng_inst_fn inst;
     void *eng;
@@ -3273,7 +3273,7 @@ static long present_wrapper(long a, long b, long c, long d)
 static void install_present_hook(void)
 {
     void *obj;
-    dlopen_fn2 dop = (dlopen_fn2)dlsym(RTLD_DEFAULT, "dlopen");
+    dlopen_fn2 dop = (dlopen_fn2)dlopen;
     void *fn;
     void *orig = NULL;
     unsigned long base;
@@ -3402,6 +3402,12 @@ static void *worker(void *arg)
 typedef int (*pthread_create_fn)(unsigned long *, const void *,
                                  void *(*)(void *), void *);
 
+/* direct weak reference: dlsym(RTLD_DEFAULT, ...) crashes when this library is
+ * dlopen()ed at run time (two-stage loader), while a direct weak call works */
+extern int pthread_create(unsigned long *tid, const void *attr,
+                          void *(*fn)(void *), void *arg)
+    __attribute__((weak));
+
 __attribute__((constructor)) static void menu_overlay_init(void)
 {
     pthread_create_fn create;
@@ -3409,16 +3415,30 @@ __attribute__((constructor)) static void menu_overlay_init(void)
 
     if (!comm_is_im())
         return;
+    /* console + file: when the overlay is dlopen()ed by a stub (rather than
+     * preloaded) this is the only way to see how far the constructor got */
     out("NM_ALIVE\n", 9);
+    /* Armed only when the marker exists.  Same idea as an SD card switch: the
+     * marker lives in /setting today (it can live on the card once im.elf has
+     * mounted it); without it the payload is completely inert. */
+    if (!file_exists("/setting/nm_arm") || file_exists("/setting/nm_off")) {
+        out("NM_DISARMED\n", 13);
+        return;
+    }
+    if (!dlsym) {
+        out("NM_NO_DLSYM\n", 12);
+        return;
+    }
     create = (pthread_create_fn)dlsym(RTLD_DEFAULT, "pthread_create");
     if (!create) {
         out("NM_NO_PTHREAD\n", 14);
         return;
     }
-    if (create(&tid, NULL, worker, NULL) == 0)
+    if (create(&tid, NULL, worker, NULL) == 0) {
         log_hex("NM_worker_tid=", tid);
-    else
+    } else {
         out("NM_WORKER_FAIL\n", 15);
+    }
 }
 
 

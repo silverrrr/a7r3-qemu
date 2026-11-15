@@ -5610,3 +5610,95 @@ NM_tab=0x7 first=0x190 count=0x38   (56)
   在原生可能出现在多个页签（本项目只放一个）。
 - 少量行重复（不同符号但同一 resid，例如"全景：方向"出现两次）。
 - 真机上 456 项的枚举耗时、点击响应还没量（QEMU 里一帧 1–3 s 是软件渲染的锅）。
+
+## 66) 能不能"把 .so 放 SD 卡、开机从卡上加载"？（2026-11-15，原型结论）
+
+用户问的是 ZV-E10 那种"卡上放 so、启动时加载、卡死拔卡恢复"能不能照搬。
+
+### 66.1 先纠正 ZV-E10 的做法
+
+`zve10-qemu/docs/MASTER_HANDOVER_NEWMENU.md`：
+
+```
+preload = /usr/tool/libefence.so : /log/libIMDB_m2.so : /log/bindm2.so
+             ↑白名单占位            ↑SONAME 顶替        ↑loop+bind 加载器
+```
+
+- 加载器 `bindm2.so` 在**内部 /log**（500 MB vfat），不是 SD；
+- SD 只是素材来源：`/sd/m2usr.img`，`bindm2` 优先用它；
+- `mount --bind` 只在内存里生效，不写 flash，重启即恢复；
+- 同仓库 `docs/BRICKPROOF_DESIGN.md` 明确：`/etc/ld.so.preload` 是当初变砖元凶。
+
+### 66.2 A7R3 不能"装载阶段从 SD 加载"
+
+已有结论（2026-11-01）：启动链里没有任何一步在 im.elf 之前读 SD
+（`/sbin/init` 只有 nflasha*，`bootin.elf` 不碰 SD，`/dev/ms1` 只出现在 im.elf，
+且 im.elf 启动时 `/setting`、`/etc` 都还没挂）。
+
+### 66.3 原型：两段式 stub（`payloads/nm_boot.c`，5 KB）
+
+```
+/usr/tool/nm_boot.so        preload 里只放它
+  -> 读 /setting/nm_payload.conf 得到载荷路径（默认 /setting/newmenu.so = 假 SD）
+  -> 线程里等路径出现（最多 20 s），然后 dlopen
+  -> 卡不在/库坏 => 什么都不做
+```
+
+实测三段：
+
+| 场景 | 结果 |
+| --- | --- |
+| 路径不存在（模拟拔卡） | `NM_BOOT absent (inert)`，**0 次 guest 异常**，相机正常 |
+| 路径存在（真去 dlopen） | `NM_ALIVE`（载荷构造函数开始）之后 guest 直接 `page translation fault at 0x00000000` |
+| 单段式（现在的装法） | 正常进菜单（`NM_items=456`） |
+
+### 66.4 为什么 dlopen 会崩
+
+我们的载荷是 `-nostdlib` 编的，**没有 DT_NEEDED**。preload 时它的未定义符号由
+全局作用域解析（能用）；`dlopen()` 进来的对象在这个固件的 loader 里解析不到
+`dlsym/dlopen/pthread_create` 这些符号，PLT 一跳就是地址 0。
+
+排错过程（都写在代码注释里）：
+1. v1 在 preload 构造函数里调 `dlsym(RTLD_DEFAULT,...)` —— 直接 0x0；
+2. v2 阻塞构造函数 5 s 不行；
+3. v3 用弱引用直接调 `pthread_create` 能过，但载荷构造函数里仍要 dlsym；
+4. 把 `dlsym(RTLD_DEFAULT,"pthread_create")` 改成弱引用后，崩点移到 worker 内部
+   的下一次 dlsym。
+⇒ 根因是"dlopen 的对象没有 DT_NEEDED libc"，不是某一行代码。
+
+要真做，需要给载荷链上固件里的 `libc.so.6`（`-l:libc.so.6`，DT_NEEDED），
+让 loader 在 dlopen 时解析它的依赖。**未验证**。
+
+### 66.5 落地的替代方案：装载门铃（arming marker）
+
+不改加载方式，只给载荷加一个开关：
+
+```
+/setting/nm_arm   存在 => 新 UI 生效
+/setting/nm_off   存在 => 强制关闭（优先级最高）
+```
+
+实测：无 `nm_arm` 时 `NM_DISARMED`、**0 次 guest 异常**、原厂 UI；
+有 `nm_arm` 时正常进完整菜单（456 项）。
+
+效果上等价"卡控安全模式"：把 marker 放在卡上（im.elf 挂载卡之后才读它）或者
+今天先放 `/setting`，**拔掉/删除 marker = 相机回原厂**，代码本身不动。
+风险面从"整套 UI 代码在 /usr"缩到"一个几行代码的开关判断"。
+
+### 66.6 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `payloads/nm_boot.c` | 两段式 stub（实验；dlopen 路径崩，注释里有完整排错记录） |
+| `qemu_a7r3/build-nm-boot.sh` | 构建 stub（5 KB） |
+| `qemu_a7r3/install-nm-boot.sh` | `on` 装两段式 / `off` 回单段式 / `status` 看现状 |
+| `qemu_a7r3/show-console-fault.sh` | 从串口日志里截取 guest 异常上下文 |
+| `qemu_a7r3/patch-overlay-arm-gate.py` | 加 `/setting/nm_arm`、`/setting/nm_off` 门铃 |
+
+### 66.7 教训
+
+1. **"能 preload" ≠ "能 dlopen"**：`-nostdlib` 的 .so 没有 DT_NEEDED，preload 靠全局
+   作用域能解析，dlopen 解析不到，症状是 0x0 页错误，看起来像随机崩。
+2. **别在 preload 构造函数里 dlsym**：那一刻弱符号还是 NULL，调用即跳 0。
+3. 串口日志要写到 `/mnt/f`（WSL 的 `/tmp` 在实例退出后会被清掉，之前两次白跑）。
+4. 这个 guest 本来就有 ~1/3 概率 page fault，判断"是不是自己改坏的"至少跑两次。
