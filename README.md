@@ -91,7 +91,8 @@ docs/
 > 以及**你自己的** A7R3 固件（eMMC 镜像、内核与 initrd）。
 >
 > 固件怎么来：见 **[docs/FIRMWARE.md](docs/FIRMWARE.md)** —— 从你自己的相机做**只读**
-> 分区 dump、拼成 QEMU 用的 eMMC 镜像。仓库里不含任何固件数据。
+> 分区 dump、拼成 QEMU 用的 eMMC 镜像（组装用
+> `payloads/scripts/make-emmc-image.sh`）。仓库里不含任何固件数据。
 
 1. 把 `qemu/bionz.c` 放进 QEMU 的 `hw/arm/`，并在 `hw/arm/Makefile.objs` 与
    `default-configs/arm-softmmu.mak` 里注册 `cxd90045` 机器（见 `qemu/README.md`）。
