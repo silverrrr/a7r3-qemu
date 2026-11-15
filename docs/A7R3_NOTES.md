@@ -5702,3 +5702,30 @@ preload = /usr/tool/libefence.so : /log/libIMDB_m2.so : /log/bindm2.so
 2. **别在 preload 构造函数里 dlsym**：那一刻弱符号还是 NULL，调用即跳 0。
 3. 串口日志要写到 `/mnt/f`（WSL 的 `/tmp` 在实例退出后会被清掉，之前两次白跑）。
 4. 这个 guest 本来就有 ~1/3 概率 page fault，判断"是不是自己改坏的"至少跑两次。
+
+### 66.8 补一轮：给载荷加上 DT_NEEDED libc.so.6（2026-11-15 晚）
+
+按 66.4 的结论试了"让 loader 能解析 dlopen 对象的依赖"：
+
+1. `extract-fw-libs.sh` 从镜像的 rootfs（nflasha7，lba 319488）里取出
+   `libc-2.11.2.so`（SONAME = `libc.so.6`）、`libpthread-2.11.2.so`、`libdl-2.11.2.so`
+   到 `analysis/libs/`（**不入库**，属于 Sony 固件内容）。
+2. `build-newmenu.sh` 检测到该目录就加
+   `-L… -Wl,--no-as-needed -l:libc-2.11.2.so`；`readelf -d` 确认
+   `NEEDED libc.so.6`。
+3. 两段式装回去（stub 在 preload、载荷放 `/setting/newmenu.so`）再启动。
+
+结果：**仍然 fault at 0x00000000**（不是 0x152c38 那个已知竞态）。又试了两个变体：
+
+| 变体 | 结果 |
+| --- | --- |
+| 载荷放 `/usr/tool/newmenu.so`（排除 vfat/noexec） | 同样 0x0 fault |
+| stub 延迟到开机 40 s 再 dlopen（排除装载期） | 同样崩（这次 boot 顺带撞上已知竞态） |
+
+⇒ DT_NEEDED 不是全部原因。这个固件的 loader 对这个"freestanding、无 crt、构造函数里
+还会 dlopen(RTLD_NOLOAD)+pthread"的对象，运行期 dlopen 就是不安全；继续深挖要动
+`/sbin/init` 或给载荷补 crt/重定位，收益不如现在的门铃方案。
+
+现状（已还原）：**单段式**（`/usr/tool/newmenu.so` 作为 preload）+ 装载门铃
+`/setting/{nm_arm,nm_off}`；本次验证启动 fault 在 `0x00152c38`，正是那个已知的
+启动竞态，不是我们的代码。
