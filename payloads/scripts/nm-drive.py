@@ -72,7 +72,16 @@ def main(argv):
         print(json.dumps(get("/touch", x=x, y=y)))
         return 0
     if cmd == "sh":
-        print(get("/sh", cmd=argv[2])["out"][-4000:])
+        print(get("/sh", cmd=argv[2], wait=8)["out"][-4000:])
+        return 0
+    if cmd == "shq":
+        # run a command and return only what it printed (marker delimited), so
+        # the guest's noisy console output does not drown the answer
+        inner = argv[2]
+        out = get("/sh", cmd="echo ZZBEGIN; %s; echo ZZEND" % inner, wait=8)["out"]
+        if "ZZBEGIN" in out and "ZZEND" in out:
+            out = out.split("ZZBEGIN", 1)[1].rsplit("ZZEND", 1)[0]
+        print(out.strip())
         return 0
     print(__doc__)
     return 1

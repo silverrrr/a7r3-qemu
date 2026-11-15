@@ -47,8 +47,14 @@
 - **别去 patch 输入函数**：`snd_InfraInputEvent_to_InputServant` 在热路径上，
   8 字节补丁会被正在执行的线程踩到，guest 直接掉进 `Exception>` 调试 shell。
   本项目改为"叠层开着 + App 又 present + 距上次触摸 >1.5 s ⇒ 当作返回"。
+- **旧菜单的点击**：原生菜单是按键式的（触摸只做对焦），网页点击要翻成
+  移动选择 + ENTER；`/nmclick` 在叠层关闭时就是这么做的。
+- **警告框变黑**：往原生渲染目标补那个 44×44 的角落按钮会和 App 画对话框撞车，
+  所以它默认关闭（`/setting/nm_badge` 才开）；叠层内部的按钮不受影响。
 - QEMU 里一帧要写 3×614400 像素（全软件模拟），点一下到画面更新 1–3 s；
   截图前多等几秒，或用 `payloads/scripts/nm-drive.py`。
+- 反复强杀 QEMU 会把 guest `/tmp` 的 FAT 写脏 → 只读挂载 → 按键文件通道失效
+  （点了没反应，但画面正常）：`payloads/scripts/fsck-guest-tmp.sh fix`。
 
 ## 5. 下一步
 

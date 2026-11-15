@@ -9,7 +9,11 @@
 #
 # The payload reads these at runtime, so no rebuild is needed:
 #   /setting/newmenu     overlay on        /setting/nm_flip    flip-buffer writes
-#   /setting/nm_keyhook  MENU key hook on  /setting/nm_nobadge no corner button
+#   /setting/nm_badge    corner button on the *native* screen (default OFF:
+#                        writing the native render target during a dialog made
+#                        the dialog come out black, see A7R3_NOTES 62.9)
+#   /setting/nm_kick     on close, poke the native UI with DOWN+UP so it repaints
+#                        instead of restoring the grabbed frame (default OFF)
 #   /setting/nm_selftest boot self test
 set -u
 IMG=/root/firmware/a7r3/qemu-emmc-2g.img
@@ -28,7 +32,8 @@ fi
 
 case "$name" in
     keyhook)  file=nm_keyhook; invert=0 ;;
-    badge)    file=nm_nobadge; invert=1 ;;
+    badge)    file=nm_badge;   invert=0 ;;
+    kick)     file=nm_kick;    invert=0 ;;
     selftest) file=nm_selftest; invert=0 ;;
     flip)     file=nm_flip;     invert=0 ;;
     overlay)  file=newmenu;     invert=0 ;;

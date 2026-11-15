@@ -124,6 +124,13 @@ static void out(const char *s, int n)
     sys3(SYS_write, 1, (long)s, n);
 }
 
+/* state changes are rare, and the host viewer watches the console for them */
+static void say(const char *s, int n)
+{
+    sys3(SYS_write, 1, (long)s, n);
+    out(s, n);
+}
+
 static void log_hex(const char *prefix, unsigned long v)
 {
     char b[48];
@@ -1001,10 +1008,10 @@ static void nm_back(void)
         return;
     if (g_page) {
         g_page = 0;
-        out("NM_BACK popup\n", 14);
+        say("NM_BACK popup\n", 14);
     } else {
         overlay_close(1);
-        out("NM_BACK close\n", 14);
+        say("NM_BACK close\n", 14);
     }
     g_dirty = 1;
 }
@@ -1437,6 +1444,7 @@ static volatile int g_present_ready;
 
 static u16 g_native_bg[MENU_W * MENU_H];
 static int g_saved_ok;
+static unsigned g_native_sum;   /* checksum of the grabbed frame */
 
 static int panel_grab(void)
 {
@@ -1447,10 +1455,10 @@ static int panel_grab(void)
     const u16 *fb;
     unsigned x, y;
 
-    fd = (int)sys3(SYS_open, (long)"/dev/mem", 0, 0);
+    fd = (int)sys3(SYS_open, (long)"/dev/mem", 2, 0);
     if (fd < 0)
         return -1;
-    m = sys4(SYS_mmap2, 0, 0x98000, 1, 1, fd, (long)(base >> 12));
+    m = sys4(SYS_mmap2, 0, 0x98000, 3, 1, fd, (long)(base >> 12));
     if (m < 0 && m > -4096) {
         sys2(SYS_close, fd, 0);
         return -2;
@@ -1469,8 +1477,24 @@ static int panel_grab(void)
     }
     sys3(SYS_munmap, m, 0x98000, 0);
     sys2(SYS_close, fd, 0);
+    {
+        unsigned sum = 0, i;
+        for (i = 0; i < (unsigned)(MENU_W * MENU_H); i++)
+            sum += g_native_bg[i];
+        g_native_sum = sum;
+        log_hex("NM_GRAB sum=", sum);
+        log_hex("NM_GRAB w0=", g_native_bg[0]);
+        log_hex("NM_GRAB w1000=", g_native_bg[1000]);
+    }
+    if (g_native_sum == 0) {
+        /* nothing on the glass yet (opened before the native UI first painted):
+         * an all-black "backup" must never be written back */
+        g_saved_ok = 0;
+        say("NM_GRAB empty\n", 14);
+        return -3;
+    }
     g_saved_ok = 1;
-    out("NM_GRAB\n", 8);
+    say("NM_GRAB\n", 8);
     return 0;
 }
 
@@ -1480,13 +1504,20 @@ static void panel_restore(void)
 
     if (!g_saved_ok)
         return;
+    if (g_native_sum == 0) {
+        /* grabbed an all-black buffer: writing it back would blank the panel
+         * until the native UI redraws (it only redraws on input) */
+        say("NM_RESTORE skipblack\n", 21);
+        g_saved_ok = 0;
+        return;
+    }
     for (i = 0; i < (unsigned)(MENU_W * MENU_H); i++)
         g_lin[i] = g_native_bg[i];
     draw_switch_icon(SW_BTN_X, SW_BTN_Y, 0);
     put_panel_at(RENDER_PA, 0);
     put_flip();
     g_saved_ok = 0;
-    out("NM_RESTORE\n", 11);
+    say("NM_RESTORE\n", 11);
 }
 
 static void overlay_open(void)
@@ -1495,12 +1526,65 @@ static void overlay_open(void)
         return;
     if (g_saved_ok)
         g_saved_ok = 0;
+    g_native_sum = 0;
     panel_grab();
     g_open = 1;
     g_selection = 0;
     g_page = 0;
     g_dirty = 1;
-    out("NM_OPEN\n", 8);
+    g_have_last = 0;          /* the panel is native content again: no gate */
+    say("NM_OPEN\n", 8);
+}
+
+/* --- poking the native view so it repaints ---------------------------
+ *
+ * The app only redraws when it gets input.  Posting a key through OSAL (the
+ * same way the shim's inject-key does) makes it redraw; DOWN+UP returns the
+ * selection to where it was, so the user only sees a flicker, not a move.
+ * ------------------------------------------------------------------ */
+
+typedef int (*osal_valloc_fn)(unsigned, void **, unsigned, int);
+typedef int (*osal_snd_fn)(unsigned, void *, unsigned, unsigned);
+
+static int g_kick_tried;
+static osal_valloc_fn g_k_valloc;
+static osal_snd_fn g_k_snd;
+
+static void kick_key(unsigned key, unsigned status)
+{
+    void *m = 0;
+    unsigned *w;
+
+    if (!g_k_valloc || !g_k_snd)
+        return;
+    if (g_k_valloc(0x807a0020u, &m, 20, 1) != 0 || !m)
+        return;
+    w = (unsigned *)m;
+    w[0] = key;
+    w[1] = 0;
+    w[2] = status;
+    w[3] = 0;
+    w[4] = 0;
+    g_k_snd(0x807a0020u, m, 20, 0);
+}
+
+static void native_kick(void)
+{
+    if (!g_kick_tried) {
+        g_kick_tried = 1;
+        if (!g_k_valloc)
+            g_k_valloc = (osal_valloc_fn)dlsym(RTLD_DEFAULT,
+                                              "osal_valloc_msg_wait");
+        if (!g_k_snd)
+            g_k_snd = (osal_snd_fn)dlsym(RTLD_DEFAULT, "osal_snd_msg");
+        log_hex("NM_KICK valloc=", (unsigned long)g_k_valloc);
+        log_hex("NM_KICK snd=", (unsigned long)g_k_snd);
+    }
+    kick_key(0x30u, 1u);           /* DOWN press  */
+    kick_key(0x30u, 0u);           /* DOWN release*/
+    kick_key(0x3u, 1u);            /* UP press    */
+    kick_key(0x3u, 0u);            /* UP release  */
+    say("NM_KICK sent\n", 13);
 }
 
 static void overlay_close(int restore)
@@ -1512,8 +1596,14 @@ static void overlay_close(int restore)
     g_open = 0;
     g_page = 0;
     g_dirty = 1;
-    if (restore)
-        panel_restore();
+    if (restore) {
+        if (g_saved_ok && g_native_sum != 0)
+            panel_restore();
+        else if (file_exists("/setting/nm_kick"))
+            native_kick();       /* opt-in: ask the native view to repaint */
+        else
+            say("NM_CLOSE norest\n", 17);
+    }
     pause_paint();
 }
 
@@ -1975,11 +2065,11 @@ static int flip_guard(void)
         if (g_page) {
             g_page = 0;
             g_last_tap_ms = now_ms();        /* absorb the follow-up frames */
-            out("NM_NATIVE_BACK page\n", 21);
+            say("NM_NATIVE_BACK page\n", 21);
             g_dirty = 1;
         } else {
             overlay_close(0);              /* the app repaints itself */
-            out("NM_NATIVE_BACK close\n", 22);
+            say("NM_NATIVE_BACK close\n", 22);
         }
         return 1;
     }
@@ -2036,9 +2126,13 @@ static void flip_put_rect(u16 *dst, int x0, int y0, int w, int h, const u16 *src
     }
 }
 
+/* The corner button over the *native* screen is opt-in: writing into the
+ * native render target while the app is drawing a dialog made the dialog come
+ * out black (the badge was the only thing left).  Inside the overlay the button
+ * is always drawn; on the native screen it needs /setting/nm_badge. */
 static int badge_enabled(void)
 {
-    return !file_exists("/setting/nm_nobadge");
+    return file_exists("/setting/nm_badge");
 }
 
 /* Write (or refresh) the switch button into one 640x480 RGBA4444 surface,
@@ -2236,7 +2330,7 @@ static void poll_key(void)
         break;
     case 'x':                      /* close the overlay: stop painting */
         overlay_close(1);
-        out("NM_CLOSE\n", 9);
+        say("NM_CLOSE\n", 9);
         break;
     case 'o':                      /* re-open the overlay */
         overlay_open();
@@ -2274,6 +2368,7 @@ static void render_and_send(void)
         if (g_present_ready) {
             /* present hook active: the wrapper drops this frame into the surface
              * the next submit blits from, so no direct panel write is needed */
+            g_dirty = 0;
             g_frames++;
             log_painted();
             return;
@@ -2281,7 +2376,8 @@ static void render_and_send(void)
         put_flip();
         rc = put_panel();
         if (rc == -3) {
-            /* native UI repainted; wait for it to go idle instead of fighting */
+            /* native UI repainted; wait for it to go idle instead of fighting.
+             * keep g_dirty so the next tick tries again */
             g_busy_ticks++;
             return;
         }
@@ -2290,6 +2386,7 @@ static void render_and_send(void)
             return;
         }
     }
+    g_dirty = 0;
     g_frames++;
     log_painted();
 }
@@ -2638,7 +2735,6 @@ static void *worker(void *arg)
                 poll_touch();
                 if (g_open) {
                     if (g_dirty && !paint_paused()) {
-                        g_dirty = 0;
                         render_and_send();
                         flip_note();
                     } else if (!paint_paused()) {
@@ -2666,9 +2762,11 @@ static void *worker(void *arg)
             log_hex("NM_FIRST_PAINT=", (unsigned long)now);
             resolve_nodes();
             flip_map();
-            /* a key file left over from a previous run must not fire now */
+            /* a key/touch file left over from a previous run must not fire now */
             sys3(SYS_unlink, (long)"/tmp/nm_key", 0, 0);
             sys3(SYS_unlink, (long)"/tmp/nm_key.tmp", 0, 0);
+            sys3(SYS_unlink, (long)"/tmp/nm_touch", 0, 0);
+            sys3(SYS_unlink, (long)"/tmp/nm_touch.tmp", 0, 0);
         }
         poll_key();
         if (!g_open) {
@@ -2703,8 +2801,7 @@ static void *worker(void *arg)
         }
         g_dirty = 0;
         render_and_send();
-        flip_note();
-    }
+        flip_note();    }
     return NULL;
 }
 
