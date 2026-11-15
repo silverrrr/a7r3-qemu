@@ -43,6 +43,8 @@ for i in $(seq 1 "$ATTEMPTS"); do
     done
     if [ "$ok" = "1" ]; then
         echo "== viewer ready on http://localhost:$PORT/ (attempt $i)" | tee -a "$LOG"
+        # stay alive so the viewer is not orphaned when this script exits
+        wait "$pid"
         exit 0
     fi
     echo "== attempt $i failed, retrying" | tee -a "$LOG"

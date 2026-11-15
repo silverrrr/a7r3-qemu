@@ -5,6 +5,13 @@
  * (see CREDITS.md and LICENSE).
  */
 
+/* menu_overlay.c -- new-menu overlay for the A7R3.
+ *
+ * Original work (MIT).  It links the zve10-derived renderer in menu_shell.c,
+ * so builds that include menu_shell.c are noncommercial only
+ * (see CREDITS.md and LICENSE).
+ */
+
 /* menu_overlay.c -- draw a complete "new menu" onto the A7R3 panel.
  *
  * Renders 640x480 RGBA4444:
@@ -1160,21 +1167,256 @@ static const char *value_of(const struct node *n, unsigned idx)
         node_title_resid((const struct node *)n->children[idx]));
 }
 
+
+/* --- own ELF symbol lookup (no dlopen/dlsym) -------------------------
+ *
+ * Finds a module by name in /proc/self/maps (lowest mapping = ELF header),
+ * parses its dynamic section and returns base+st_value for a symbol.
+ * Step 1: only libobj_base()/resolve_commit() use it.
+ * ------------------------------------------------------------------ */
+
+static void pm_reload_maps(void);
+
+static unsigned long mod_base(const char *needle)
+{
+    static char buf[65536];
+    int fd, n;
+    char *p, *end;
+    unsigned long best = 0;
+
+    fd = (int)sys3(SYS_open, (long)"/proc/self/maps", 0, 0);
+    if (fd < 0)
+        return 0;
+    n = 0;
+    while (n < (int)sizeof(buf) - 1) {
+        long r = sys3(SYS_read, fd, (long)(buf + n),
+                      (long)(sizeof(buf) - 1 - (unsigned)n));
+        if (r <= 0)
+            break;
+        n += (int)r;
+    }
+    sys2(SYS_close, fd, 0);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    p = buf;
+    end = buf + n;
+    while (p < end) {
+        char *line = p;
+        unsigned long lo = 0;
+        const char *q;
+
+        while (p < end && *p != '\n')
+            p++;
+        if (p < end)
+            *p = 0;
+        else
+            p = end;
+        if (str_has(line, needle)) {
+            for (q = line; *q && *q != '-'; q++) {
+                int d;
+                char c = *q;
+                if (c >= '0' && c <= '9')
+                    d = c - '0';
+                else if (c >= 'a' && c <= 'f')
+                    d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F')
+                    d = c - 'A' + 10;
+                else
+                    break;
+                lo = (lo << 4) | (unsigned)d;
+            }
+            if (lo && (!best || lo < best))
+                best = lo;
+        }
+        if (p >= end)
+            break;
+        p++;
+    }
+    return best;
+}
+
+struct mod_syms {
+    unsigned long symtab, strtab, strsz, nchain;
+};
+
+static int mod_parse(unsigned long base, struct mod_syms *m)
+{
+    const unsigned char *eh = (const unsigned char *)base;
+    unsigned e_phoff, e_phentsize, e_phnum, i;
+    unsigned long dyn = 0, dyn_len = 0, hash = 0, gnu_hash = 0;
+    unsigned char *z = (unsigned char *)m;
+
+    for (i = 0; i < sizeof(*m); i++)
+        z[i] = 0;
+    if (!eh || !pm_readable(eh, 0x34))
+        return -1;
+    __builtin_memcpy(&e_phoff, eh + 0x1c, 4);
+    __builtin_memcpy(&e_phentsize, eh + 0x2a, 2);
+    __builtin_memcpy(&e_phnum, eh + 0x2c, 2);
+    if (e_phnum > 64 || e_phentsize < 32)
+        return -2;
+    for (i = 0; i < e_phnum; i++) {
+        const unsigned char *ph = eh + e_phoff + i * e_phentsize;
+        unsigned type, vaddr, memsz;
+        if (!pm_readable(ph, 32))
+            return -3;
+        __builtin_memcpy(&type, ph + 0, 4);
+        __builtin_memcpy(&vaddr, ph + 8, 4);
+        __builtin_memcpy(&memsz, ph + 20, 4);
+        if (type == 2) {
+            dyn = base + vaddr;
+            dyn_len = memsz;
+            break;
+        }
+    }
+    if (!dyn || !pm_readable((const void *)dyn, (unsigned)dyn_len))
+        return -4;
+    for (i = 0; i + 8 <= dyn_len; i += 8) {
+        unsigned tag, val;
+        __builtin_memcpy(&tag, (const void *)(dyn + i), 4);
+        __builtin_memcpy(&val, (const void *)(dyn + i + 4), 4);
+        if (tag == 0)
+            break;
+        switch (tag) {
+        case 4:  hash = val; break;
+        case 5:  m->strtab = val; break;
+        case 6:  m->symtab = val; break;
+        case 10: m->strsz = val; break;
+        case 0x6ffffef5UL: gnu_hash = val; break;
+        default: break;
+        }
+    }
+    if (m->symtab && !pm_readable((const void *)m->symtab, 16) &&
+        pm_readable((const void *)(base + m->symtab), 16))
+        m->symtab += base;
+    if (m->strtab && !pm_readable((const void *)m->strtab, 8) &&
+        pm_readable((const void *)(base + m->strtab), 8))
+        m->strtab += base;
+    if (!m->symtab || !m->strtab)
+        return -5;
+    if (hash && pm_readable((const void *)(hash + base), 8))
+        __builtin_memcpy(&m->nchain, (const void *)(hash + base + 4), 4);
+    else if (hash && pm_readable((const void *)hash, 8))
+        __builtin_memcpy(&m->nchain, (const void *)(hash + 4), 4);
+    if ((m->nchain < 8 || m->nchain > 65536) && gnu_hash) {
+        unsigned long gh = gnu_hash;
+        unsigned nbuckets, symoffset, bloom_size;
+        if (!pm_readable((const void *)gh, 16) &&
+            pm_readable((const void *)(base + gh), 16))
+            gh += base;
+        if (pm_readable((const void *)gh, 16)) {
+            __builtin_memcpy(&nbuckets, (const void *)gh, 4);
+            __builtin_memcpy(&symoffset, (const void *)(gh + 4), 4);
+            __builtin_memcpy(&bloom_size, (const void *)(gh + 8), 4);
+            if (nbuckets < 65536u && bloom_size < 65536u) {
+                unsigned long buckets = gh + 16 + (unsigned long)bloom_size * 4;
+                unsigned long chain = buckets + (unsigned long)nbuckets * 4;
+                unsigned max_sym = 0, k;
+                for (k = 0; k < nbuckets; k++) {
+                    unsigned b;
+                    if (!pm_readable((const void *)(buckets + k * 4), 4))
+                        break;
+                    __builtin_memcpy(&b, (const void *)(buckets + k * 4), 4);
+                    if (b > max_sym)
+                        max_sym = b;
+                }
+                if (max_sym >= symoffset) {
+                    for (;;) {
+                        unsigned c;
+                        unsigned long o =
+                            chain + (unsigned long)(max_sym - symoffset) * 4;
+                        if (!pm_readable((const void *)o, 4))
+                            break;
+                        __builtin_memcpy(&c, (const void *)o, 4);
+                        max_sym++;
+                        if (c & 1u)
+                            break;
+                        if (max_sym > 200000u)
+                            break;
+                    }
+                }
+                m->nchain = max_sym;
+            }
+        }
+    }
+    if (m->nchain < 8 || m->nchain > 65536)
+        m->nchain = 20000;
+    return 0;
+}
+
+static unsigned long mod_sym(const char *needle, const char *name)
+{
+    struct mod_syms ms;
+    unsigned long base;
+    unsigned i;
+    int nl = 0;
+
+    if (!needle || !name)
+        return 0;
+    while (name[nl])
+        nl++;
+    /* the maps cache may predate the firmware mapping its libraries; the
+     * enumeration path reloads it, so do the same here (once) */
+    {
+        static int reloaded;
+        if (!reloaded) {
+            reloaded = 1;
+            pm_reload_maps();
+        }
+    }
+    base = mod_base(needle);
+    if (!base) {
+        log_hex("NM_MODSYM nobase ", (unsigned long)needle);
+        return 0;
+    }
+    {
+        int rc = mod_parse(base, &ms);
+        if (rc != 0) {
+            log_hex("NM_MODSYM noparse rc=", (unsigned long)rc);
+            log_hex("NM_MODSYM base=", base);
+            return 0;
+        }
+    }
+    for (i = 1; i < ms.nchain; i++) {
+        const unsigned char *sym = (const unsigned char *)(ms.symtab + i * 16);
+        unsigned st_name, st_value;
+        const char *s;
+        int k;
+        if (!pm_readable(sym, 16))
+            break;
+        __builtin_memcpy(&st_name, sym + 0, 4);
+        __builtin_memcpy(&st_value, sym + 4, 4);
+        if (!st_name || !st_value)
+            continue;
+        if (ms.strsz && st_name >= ms.strsz)
+            continue;
+        s = (const char *)(ms.strtab + st_name);
+        if (!pm_readable(s, (unsigned)nl + 1))
+            continue;
+        for (k = 0; k < nl; k++)
+            if (s[k] != name[k])
+                break;
+        if (k != nl || s[nl] != 0)
+            continue;
+        return base + st_value;
+    }
+    log_hex("NM_MODSYM notfound n=", (unsigned long)ms.nchain);
+    return 0;
+}
+
 static void resolve_commit(void)
 {
     if (g_commit_tried)
         return;
     g_commit_tried = 1;
-    if (!g_caution && dlopen)
-        g_caution = dlopen("/usr/lib/CautionConfig.so", 5);
-    if (g_caution && dlsym) {
-        g_commit_fn = (commit_fn)dlsym(
-            g_caution, "_ZN18CmnViewSettingNode22setItemSelectedByIndexEi");
-        g_commit_sr = (commit_fn)dlsym(
-            g_caution, "_ZN18CmnViewSettingNode22setItemSelectedBySRNumEi");
-        g_get_sr_idx = (getint2_fn)dlsym(
-            g_caution, "_ZN18CmnViewSettingNode15getSRNumByIndexEiRi");
-    }
+    /* no dlopen: look the methods up in the already mapped module */
+    g_commit_fn = (commit_fn)mod_sym(
+        "/CautionConfig.so", "_ZN18CmnViewSettingNode22setItemSelectedByIndexEi");
+    g_commit_sr = (commit_fn)mod_sym(
+        "/CautionConfig.so", "_ZN18CmnViewSettingNode22setItemSelectedBySRNumEi");
+    g_get_sr_idx = (getint2_fn)mod_sym(
+        "/CautionConfig.so", "_ZN18CmnViewSettingNode15getSRNumByIndexEiRi");
     log_hex("NM_commit=", (unsigned long)g_commit_fn);
     log_hex("NM_commit_sr=", (unsigned long)g_commit_sr);
     log_hex("NM_getsr=", (unsigned long)g_get_sr_idx);
@@ -2221,16 +2463,10 @@ static void list_children(void)
 
 static unsigned long libobj_base(void)
 {
-    void *obj, *fn;
-    if (!dlopen || !dlsym)
-        return 0;
-    obj = dlopen("/usr/lib/libObj.so", 5);
-    if (!obj)
-        return 0;
-    fn = dlsym(obj, "GRM_bitmapCreate");
+    unsigned long fn = mod_sym("/libObj.so", "GRM_bitmapCreate");
     if (!fn)
         return 0;
-    return (unsigned long)fn - LIBOBJ_GRM_CREATE;
+    return fn - LIBOBJ_GRM_CREATE;
 }
 
 static unsigned now_ms(void)

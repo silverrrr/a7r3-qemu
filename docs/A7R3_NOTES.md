@@ -5802,3 +5802,34 @@ guest 异常/竞态（`0x152c38` 与 `0x0` 各一次），无法判断是新代�
 结论：**载荷回滚到 796ae5c 的验证版本**（step 1 补丁留在脚本里单独跑）。
 下次验证 step 1 的顺序：`fsck-guest-tmp.sh clean` -> `boot-until-ready.sh` ->
 viewer 就绪后再点右上角 -> 看 `NM_getsr` 是否非 0、行值是否为真实值。
+
+### 66.13 ★ Step 1 完成并验证：反射查找替代 dlopen/dlsym
+
+按"一次只动一处"先只改了 `libobj_base()` 与 `resolve_commit()`（枚举仍用 dlsym）。
+三个 bug 依次修掉后通过：
+
+| 现象 | 原因 | 修法 |
+| --- | --- | --- |
+| `NM_getsr=0x0`，符号全找不到 | maps 缓存是旧的（枚举路径会先 `pm_reload_maps()`，这两处没有），`pm_readable` 因此拒绝了模块页 | `mod_sym()` 首次调用时 `pm_reload_maps()` 一次 |
+| `NM_MODSYM notfound n=0x2000` | 没有 DT_HASH 时默认按 8192 个符号扫，而 CautionConfig 的动态符号远多于此 | 按 GNU hash 的 buckets→chain 走到链尾算真实数量（与枚举同一套算法），兜底提到 20000 |
+
+修好后实测（单次干净启动）：
+
+```
+NM_getsr=0x14de63f9
+NM_commit=0x14de67a5
+NM_commit_sr=0x14de67c7
+```
+
+- 菜单显示真实值：拍摄=自动、拍摄：手动=开、APS-C/Super 35mm=1/1、创意风格=标准、
+  DRO/自动HDR=关、跌落传感器=开（54 项 / 第 1 页共 9 页）；
+- 打开二级页并应用：`NM_POPUP apply idx=2 → sr=2 → selected=2`，
+  即反射找到的 `setItemSelectedBySRNum` 真的执行了。
+
+⇒ **`libobj_base()` 和 `resolve_commit()` 现在完全不依赖 dlopen/dlsym**。
+枚举（456 项）暂时仍是 dlsym，那是 step 2。
+
+工具补充（这轮踩到的两个环境问题）：
+- `fsck-guest-tmp.sh clean`：`/tmp` 满（12 MB）会让按键通道静默失效；
+- `boot-until-ready.sh`：自动重试 ~1/3 概率的启动竞态；脚本成功后要 `wait`，
+  否则 viewer 会随父进程一起退出（这轮第二次验证就是被这个打断的）。
