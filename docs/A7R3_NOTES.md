@@ -5759,3 +5759,25 @@ preload = /usr/tool/libefence.so : /log/libIMDB_m2.so : /log/bindm2.so
 | `payloads/nm_probe.c` + `build-nm-probe.sh` | 1.8 KB 最小 dlopen 探针 |
 | `-DNM_LITE`（`menu_overlay.c` 构造函数里的 `#ifdef`） | 只加载不启动 worker 的变体 |
 | `patch-overlay-direct-pthread.py` | 构造函数优先用弱引用 `pthread_create`（dlopen 路径需要），失败再 dlsym |
+
+### 66.11 又尝试：把 dlopen/dlsym 全部换掉（已搁置）
+
+思路：既然 dlopen 载荷之后、载荷*自己*再 dlopen 会崩，那就让载荷完全不调
+dlopen/dlsym —— 模块基址从 `/proc/self/maps` 拿，符号表直接从映射进来的 ELF 里解，
+节点地址 = base + st_value，函数地址同样按名字查。
+
+结果：第一次实现后菜单变成 **0 项**（`NM_elf_base=0x0`），才发现
+`module_base_from_maps()` **一直没工作过** —— 之前能枚举 456 项，靠的是
+`elf_base_of()` 那个"向下扫 ELF magic"的兜底（因为兜底需要先有一个符号地址来自
+`dlsym`，去掉 dlsym 后这条兜底也没了）。
+
+改成"取所有含该模块名的 mapping 里最低的 lo"后重新编译，但接下来两次启动都撞上
+guest 异常/竞态（`0x152c38` 与 `0x0` 各一次），无法判断是新代码的问题还是环境。
+为不把可用状态搞坏，**已把 `menu_overlay.c` 还原到 796ae5c 的版本**（完整菜单 +
+装载门铃 + 弱引用 pthread），并复测通过（54 项/1 页签 显示正常）。
+
+结论/遗留：
+- 反射式符号查找（无 dlopen）是打通两段式的正路，方向已验证（probe/lite 都能
+  dlopen 成功），差的只是把 `el_base`/符号解析调通并跑通两次干净启动。
+- 下次继续时：先只替换 `libobj_base()`/`resolve_commit()` 两处（不碰 456 项枚举），
+  确认单段式仍正常；再替换枚举；最后再试两段式。
