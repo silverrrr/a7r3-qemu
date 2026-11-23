@@ -6043,3 +6043,27 @@ PUB stage=rollback_remount_ro code=12 rc=0
 
 ⇒ 发布器现在具备：preimage + 自带 SHA-256、同文件系统暂存、硬链保留、原子 rename、
 目录 fsync、回读校验、remount ro + `EROFS` 验证、失败回滚、故障注入自测。
+
+### 74.1 双槽事务日志与 fail-closed 守卫
+
+`payloads/journal_min.h` 定义 256 B 双槽记录（magic `A7GXST01`、seq、phase、boot_id、
+old/new SHA、末尾 32 B 自校验）。发布器在替换前写 `STARTED`、成功后写 `ACCEPTED`、
+回滚后写 `FAILURE`；`payloads/guard.c` 读双槽判断相位：`ACCEPTED/FAILURE` 不动，
+`STARTED` 则等 `<journal>/ready` 最多 N 秒，超时就用 stock 副本回滚并写 `FAILURE`。
+
+`fail_after_stage` 支持负数（`-7` = 第 7 阶段后直接退出、不回滚），用来模拟掉电。
+
+QEMU 实测：
+
+* 模拟掉电（rename 之后退出）→ 重启后 guard 输出
+  `started → remount_rw → standby → verify → remount_ro → journal_failure →
+  GUARD ROLLED_BACK`，内容恢复、权限 `0555`、`/usr` 回到 `ro`；
+* 正常发布 → `journal_accepted` + `PUB OK`，guard 输出 `accepted` 并放行。
+
+两个实测坑：写 `ACCEPTED/FAILURE` 时 `old/new` 哈希为空会让 `j_build` 解引用空指针
+（已判空）；中断残留的 `*.retained` 会让再次 `linkat` 返回 `EEXIST`，但**不能删**
+（可能是 im.elf 映射 inode 的唯一引用，删了 `remount ro` 会 `EBUSY`），故改用
+`*.retained.alt` / `*.retained.rb` 备用名。
+
+还缺：把 guard 挂到开机早期（`/etc/profile → /tmp/profile`），以及 ready 屏障由常驻组件
+真正写出；guard 的“受限一次重试”尚未实现。

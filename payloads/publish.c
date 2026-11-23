@@ -142,6 +142,8 @@ static void out_sha(const u8 *h) {
 }
 
 #include "sha256_min.h"
+#include "journal_min.h"
+#define SYS_getpid 20
 
 static int hex_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -214,6 +216,79 @@ static int target_mode(const char *path) {
     return mode;
 }
 
+
+static int fsync_path_dir(const char *dir);
+
+/* --- journal helpers (optional: only used when a journal dir is given) --- */
+static int read_text(const char *path, char *buf, int cap) {
+    long fd = sys3(SYS_open, (s32)path, O_RDONLY, 0);
+    int n = 0;
+    if (fd < 0) return -1;
+    while (n < cap - 1) {
+        long r = sys3(SYS_read, (s32)fd, (s32)(buf + n), (long)(cap - 1 - n));
+        if (r <= 0) break;
+        n += (int)r;
+    }
+    sys1(SYS_close, (s32)fd);
+    buf[n] = 0;
+    return n;
+}
+static void boot_id(char out[37]) {
+    int i;
+    for (i = 0; i < 36; i++) out[i] = 0;
+    if (read_text("/proc/sys/kernel/random/boot_id", out, 37) < 0) {
+        for (i = 0; i < 36; i++) out[i] = '0';
+        out[36] = 0;
+    }
+    for (i = 0; i < 36; i++) {
+        if (out[i] == '\n' || out[i] == 0) { out[i] = 0; break; }
+    }
+}
+static int slot_file(char *buf, int cap, const char *dir, int second) {
+    int i = 0;
+    const char *a = "/state.a", *b = "/state.b";
+    const char *suf = second ? b : a;
+    if (!dir || !*dir) return -1;
+    while (*dir && i < cap - 1) buf[i++] = *dir++;
+    for (int k = 0; suf[k] && i < cap - 1; k++) buf[i++] = suf[k];
+    buf[i] = 0;
+    return 0;
+}
+static unsigned long journal_max_seq(const char *dir) {
+    char path[256];
+    u8 rec[J_BYTES];
+    unsigned long best = 0, seq;
+    int k;
+    for (k = 0; k < 2; k++) {
+        if (slot_file(path, sizeof path, dir, k)) continue;
+        if (read_text(path, (char *)rec, J_BYTES) != J_BYTES) continue;
+        if (j_check(rec, &seq, 0, 0, 0, 0) != 1) continue;
+        if (seq > best) best = seq;
+    }
+    return best;
+}
+static int journal_write(const char *dir, unsigned long seq, u32 phase,
+                         u32 code, const u8 old_sha[32], const u8 new_sha[32]) {
+    char path[256], boot[37];
+    u8 rec[J_BYTES];
+    long fd;
+    if (!dir || !*dir) return 0;
+    if (slot_file(path, sizeof path, dir, (int)(seq & 1))) return -1;
+    boot_id(boot);
+    j_build(rec, seq, phase, code, (u32)sys1(SYS_getpid, 0), boot,
+            old_sha, new_sha);
+    fd = sys3(SYS_open, (s32)path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    if (sys3(SYS_write, (s32)fd, (s32)rec, J_BYTES) != J_BYTES) {
+        sys1(SYS_close, (s32)fd);
+        return -1;
+    }
+    sys1(SYS_fsync, (s32)fd);
+    sys1(SYS_close, (s32)fd);
+    fsync_path_dir(dir);
+    return 0;
+}
+
 static int remount(const char *mp, int ro) {
     long flags = MS_REMOUNT | (ro ? MS_RDONLY : 0);
     return (int)sys5(SYS_mount, 0, (s32)mp, 0, flags, 0);
@@ -244,6 +319,11 @@ static void say_stage(const char *name, int stage, int rc) {
             say_stage("inject_fail", STAGE_ROLLBACK, -777); \
             goto rollback; \
         } \
+        if (fail_after == -(n)) { \
+            out("PUB abort_after_stage="); out_dec(n); \
+            out(" (no rollback: simulating a power cut)\n"); \
+            sys1(SYS_exit, 200); \
+        } \
     } while (0)
 
 int run(int argc, char **argv) {
@@ -252,6 +332,10 @@ int run(int argc, char **argv) {
     long want_size, size = 0;
     int renamed = 0, linked = 0, staged = 0;
     int fail_after = 0;
+    const char *journal_dir = 0;
+    const char *retained_use = retained;
+    char retained_alt[256];
+    unsigned long jseq = 0;
     long link_rc;
     int rc;
 
@@ -264,18 +348,22 @@ int run(int argc, char **argv) {
         out("HASH "); out_sha(h); out(" size="); out_dec((int)n); out("\n");
         return 0;
     }
-    if (argc != 9 && argc != 10) {
+    if (argc < 9 || argc > 11) {
         out("PUB usage: <mount> <target> <retained> <standby> <source> "
-            "<oldsha> <newsha> <size> [fail_after_stage]\n");
+            "<oldsha> <newsha> <size> [fail_after_stage] [journal_dir]\n");
         return STAGE_ARG;
     }
-    if (argc == 10) {
+    if (argc >= 10) {
         const char *p = argv[9];
+        int neg = 0;
+        if (*p == '-') { neg = 1; p++; }
         while (*p >= '0' && *p <= '9') {
             fail_after = fail_after * 10 + (*p++ - '0');
         }
         if (*p) return STAGE_ARG;
+        if (neg) fail_after = -fail_after;
     }
+    journal_dir = (argc >= 11) ? argv[10] : 0;
     mp = argv[1]; target = argv[2]; retained = argv[3];
     standby = argv[4]; source = argv[5];
     if (parse_sha(argv[6], want_old) || parse_sha(argv[7], want_new)) {
@@ -329,10 +417,31 @@ int run(int argc, char **argv) {
     say_stage("standby_hash", STAGE_STANDBY_HASH, 0);
     MAYBE_FAIL(STAGE_STANDBY_HASH);
 
+    if (journal_dir) {
+        jseq = journal_max_seq(journal_dir) + 1;
+        if (journal_write(journal_dir, jseq, J_STARTED, 0, want_old, want_new))
+            say_stage("journal_started", STAGE_ROLLBACK, -1);
+        else
+            say_stage("journal_started", STAGE_ROLLBACK, 0);
+    }
+
     /* keep the mapped old inode reachable before replacing it */
     /* linkat takes five arguments (olddirfd, oldpath, newdirfd, newpath, flags) */
     link_rc = sys5(SYS_linkat, AT_FDCWD, (s32)target, AT_FDCWD,
                    (s32)retained, 0);
+    if (link_rc == -17) {
+        /* A stale alias from an interrupted run must not be removed: it may be
+         * the last reference to the inode im.elf maps.  Use a second name. */
+        int n = 0;
+        const char *r = retained;
+        while (*r && n < 246) retained_alt[n++] = *r++;
+        retained_alt[n++] = '.'; retained_alt[n++] = 'a';
+        retained_alt[n++] = 'l'; retained_alt[n++] = 't';
+        retained_alt[n] = 0;
+        retained_use = retained_alt;
+        link_rc = sys5(SYS_linkat, AT_FDCWD, (s32)target, AT_FDCWD,
+                       (s32)retained_use, 0);
+    }
     if (link_rc < 0) {
         say_stage("link", STAGE_LINK, (int)link_rc);
         goto rollback;
@@ -370,12 +479,16 @@ int run(int argc, char **argv) {
         return STAGE_READONLY_CHECK;
     }
     say_stage("readonly_check", STAGE_READONLY_CHECK, 0);
+    if (journal_dir)
+        say_stage("journal_accepted", STAGE_ROLLBACK,
+                  journal_write(journal_dir, jseq + 1, J_ACCEPTED, 0,
+                                want_old, want_new));
     out("PUB OK\n");
     return 0;
 
 rollback:
     if (renamed) {
-        rc = (int)sys4(SYS_renameat, AT_FDCWD, (s32)retained, AT_FDCWD,
+        rc = (int)sys4(SYS_renameat, AT_FDCWD, (s32)retained_use, AT_FDCWD,
                        (s32)target);
         say_stage("rollback_rename", STAGE_ROLLBACK, rc);
         fsync_path_dir(mp);
@@ -386,11 +499,15 @@ rollback:
         staged = 0;
     }
     if (linked) {
-        sys3(SYS_unlinkat, AT_FDCWD, (s32)retained, 0);
+        sys3(SYS_unlinkat, AT_FDCWD, (s32)retained_use, 0);
         linked = 0;
     }
     rc = remount(mp, 1);
     say_stage("rollback_remount_ro", STAGE_ROLLBACK, rc);
+    if (journal_dir)
+        say_stage("journal_failure", STAGE_ROLLBACK,
+                  journal_write(journal_dir, jseq + 1, J_FAILURE, 1,
+                                want_old, want_new));
     return STAGE_ROLLBACK;
 }
 
