@@ -6150,3 +6150,27 @@ GUARD stage=accept rc=0
 
 遗留：本次目标权限是 `0644`（上一轮回滚遗留），需再做一次完整的 `0555 → 掉电 → 回滚`
 验证确认 `mode=0555` 生效；“受限一次重试”仍未实现；`ready` 文件需在下次发布前清理。
+
+### 78.1 受限一次重试
+
+`guard.c` 现在读两个槽并保留 seq/phase/boot_id，按 a7r3-boot-runtime 的窄化条件判断：
+
+```
+retry_ok = 前一条有效 && 前一条.phase == ACCEPTED
+        && 最新.seq == 前一条.seq + 1
+        && 三条 boot_id 互不相同
+```
+
+`retry_ok` 为假 ⇒ 立即回滚（fail-closed）；为真 ⇒ 等 `ready`（90 s），等到就 `ACCEPTED`
+并 remount ro。
+
+实测 A（新鲜 journal，不允许重试）：`retry_denied` → 立即回滚 → `ROLLED_BACK`；
+`/usr` 回 `ro`、**权限恢复 0555**、内容 = stock、journal = FAILURE。
+
+实测 B（先 ACCEPTED 再 STARTED，应当允许重试）：guard 却输出 `accepted`，说明它读到的最高
+seq 是 ACCEPTED 那条而不是刚写的 STARTED。怀疑 `journal_max_seq()` 读取失败时会从 0 重新计数，
+两条记录落到同一槽互相覆盖（或 ready 文件残留影响了判定）。下轮先给 guard 加 `dump` 模式
+打印两槽真实 seq/phase/boot 再修。
+
+结论：主链路（放行 / 回滚 / ready 接受）均已跨启动验证；“受限重试”的拒绝分支已验证，
+允许分支待查。
