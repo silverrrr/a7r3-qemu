@@ -6214,3 +6214,35 @@ seq 自增与相位都正确。
 
 下一轮的正确顺序（不手工干预）：启动 A 正常发布（ACCEPTED）→ 重启 B 只跑 `publish -7`
 （STARTED）→ 重启 C，guard 应判 `retry_allowed` 并等待 `ready` 后 `accept`。
+
+### 81.1 受限重试允许分支：跨三次启动验证通过
+
+| 启动 | 操作 | 结果 |
+| --- | --- | --- |
+| A | `rm -rf /setting/inst` + 正常 publish | `STARTED(seq1)` → `ACCEPTED(seq2)`，boot=A |
+| B | 只跑 `publish … -7`（rename 后退出） | `STARTED(seq3)`，boot=B |
+| C | 不干预（stub 自动拉起 guard） | `retry_allowed` → 等 ready → accept |
+
+启动 C 日志：
+
+```
+GUARD stage=started rc=0
+GUARD stage=retry_allowed rc=0
+GUARD ready_seen
+GUARD stage=accept_remount_ro rc=0
+GUARD stage=accept rc=0
+```
+
+最终：`/usr` 为 `ro`，journal `seq=4 ACCEPTED`（boot=C），旧槽保留 `seq=3 STARTED`（boot=B）。
+
+三条分支现在都有跨启动实测：
+
+| 场景 | 判定 | 结果 |
+| --- | --- | --- |
+| 正常发布 | `accepted` | 放行 |
+| 中断且无前一次 ACCEPTED | `retry_denied` | 立即回滚 |
+| 中断且前一次 ACCEPTED、跨启动 | `retry_allowed` | 等 ready → ACCEPTED |
+
+注意：三次启动之间绝不能手工删 `/usr` 里的 retained 别名（§80.3 的 EBUSY 教训）；
+发布器在 retained 已存在时会自动改用 `*.retained.alt`。镜像经 `e2fsck -fy` 修复后干净，
+`libIMDB.so` 内容恢复为原始 `c5adc8f6…`、权限 `0555`、无残留别名。
