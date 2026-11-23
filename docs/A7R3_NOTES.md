@@ -6174,3 +6174,23 @@ seq 是 ACCEPTED 那条而不是刚写的 STARTED。怀疑 `journal_max_seq()` �
 
 结论：主链路（放行 / 回滚 / ready 接受）均已跨启动验证；“受限重试”的拒绝分支已验证，
 允许分支待查。
+
+### 79.1 受限重试的 seq 问题（未闭环）
+
+`read_text()` 最多只读 `cap-1` 字节，读 256 B 的槽永远不等于 `J_BYTES`，于是
+`journal_max_seq()` 恒为 0、每次发布 seq 从 1 重来、两槽互相覆盖——这就是 §78 里
+“应当允许重试却显示 accepted”的原因。已新增二进制精确读取 `read_bin()` 并让 journal 使用它。
+
+同时给 guard 加了 `dump` 模式：
+
+```
+/setting/guard.elf dump /setting/inst
+SLOT 0 valid=1 seq=0 phase=2 boot=aea20322-…
+SLOT 1 valid=1 seq=0 phase=1 boot=aea20322-…
+```
+
+修复后 `phase`(24)/`boot`(36) 正确，但 `seq`(16, `j_put64`) 仍读回 0，受限重试的允许分支
+仍无法触发。下一步：给 `journal_min.h` 加宿主机单元测试（把 `u32l` 固定为 32 位）+
+在 dump 里打印 seq 原始 8 字节，确认是“没写入”还是“读错偏移”。
+
+其余结论不受影响：发布器主链路、guard 的三种判定、权限 0555 恢复均已跨启动验证。
