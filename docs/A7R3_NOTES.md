@@ -6067,3 +6067,24 @@ QEMU 实测：
 
 还缺：把 guard 挂到开机早期（`/etc/profile → /tmp/profile`），以及 ready 屏障由常驻组件
 真正写出；guard 的“受限一次重试”尚未实现。
+
+### 75.1 A7R3 没有 `/etc/profile → /tmp/profile` 这条早期钩子
+
+`a7r3-boot-runtime` 的早期守护依赖“开机 shell source `/etc/profile`，再由它拉起
+`/tmp/profile`”。在真实 A7R3 3.10 固件里这条链**不存在**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `/tmp/profile` 字符串（nflasha1/5/7/15 全量 grep） | 0 命中 |
+| `/etc`（nflasha10 vfat，运行时挂载） | 无 profile，只有 dhcpd.conf/mtab/toprc 等 |
+| rootfs `/etc`（nflasha7） | 空目录 |
+| `bootin.elf` | 只做 `mount -t tmpfs none /tmp/lt` + leaktracer 的 fifo/链接，不 source 任何脚本 |
+| `im.elf` / `launch_shell.elf` | 无 profile / `/etc/` 字符串 |
+
+⇒ 不能照抄 `/etc/profile` 方案。替代：把 guard 放进已有的 preload stub（`nm_boot.so`）——
+它本来就在 im.elf 启动早期运行、并且已经在轮询 `/setting`：先读双槽日志，若相位是
+`STARTED` 就在 `dlopen` 叠层载荷之前 `fork`+`execve("/setting/guard.elf")` 并 `wait4`，
+完成后再加载载荷；载荷首帧绘制成功后写 `<journal>/ready`，供下一轮判定。
+
+待办：stub 里加 fork/exec/wait（raw syscall 2/11/114）；载荷写 ready；
+然后才能做“掉电 → 下次开机自动回滚”的跨启动自动化测试。
