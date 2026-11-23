@@ -258,9 +258,9 @@ int run(int argc, char **argv) {
     char ready[256], retained2[256];
     int rc;
 
-    if (argc != 10) {
+    if (argc != 8) {
         out("GUARD usage: <journal> <wait_s> <mount> <target> <retained> "
-            "<standby> <stock> <stock_sha256> <stock_size>\\n");
+            "<standby> <stock>\n");
         return 2;
     }
     jdir = argv[1];
@@ -268,16 +268,11 @@ int run(int argc, char **argv) {
     { const char *p = argv[2]; while (*p >= '0' && *p <= '9') wait_max = wait_max * 10 + (*p++ - '0'); }
     mount = argv[3]; target = argv[4]; retained = argv[5];
     standby = argv[6]; stock = argv[7];
-    if (str_len(argv[8]) != 64) return 2;
-    {
-        int i;
-        for (i = 0; i < 32; i++) {
-            int hi = argv[8][2 * i], lo = argv[8][2 * i + 1];
-            hi = (hi <= '9') ? hi - '0' : (hi | 32) - 'a' + 10;
-            lo = (lo <= '9') ? lo - '0' : (lo | 32) - 'a' + 10;
-            want_stock[i] = (u8)((hi << 4) | lo);
-        }
-    }
+
+    /* the expected hash is the hash of the stock copy itself, so callers do not
+     * have to carry it around */
+    rc = (int)hash_file(stock, want_stock);
+    if (rc) { say("stock_hash", rc); return 2; }
 
     seq = get_seq(jdir, &found, &phase);
     if (!found) { say("no_journal", 0); return 0; }

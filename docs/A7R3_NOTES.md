@@ -6088,3 +6088,34 @@ QEMU 实测：
 
 待办：stub 里加 fork/exec/wait（raw syscall 2/11/114）；载荷写 ready；
 然后才能做“掉电 → 下次开机自动回滚”的跨启动自动化测试。
+
+### 76.1 跨启动自动回滚跑通
+
+`nm_boot.so` 在加载叠层载荷前先读 `/setting/inst` 的双槽日志：相位是 `STARTED` 就
+`fork` + `execve("/setting/guard.elf", …)`（**不等待**，避免卡住 im.elf 启动），然后照常
+`dlopen` 载荷；其它相位直接加载。guard 参数简化为 7 个，stock 的期望哈希由它自己算。
+
+QEMU 实测（真实跨启动，不是同一会话）：
+
+1. 正常启动，建 `/setting/inst` + `stock.so`；
+2. 用 `publish.elf … -7 /setting/inst` 写 `STARTED`、完成 rename 后直接退出（模拟掉电），
+   `/usr` 留在 rw；
+3. 硬停 QEMU 再启动，开机日志：
+
+```
+NM_BOOT journal STARTED -> guard
+NM_BOOT guard_pid=0x8f
+GUARD stage=started rc=0
+GUARD stage=remount_rw rc=0
+GUARD stage=standby rc=0
+GUARD stage=verify rc=0
+GUARD stage=remount_ro rc=0
+GUARD stage=journal_failure rc=0
+GUARD ROLLED_BACK
+NM_BOOT loaded
+```
+
+4. 结果：`/usr` 回到 `ro`、目标哈希 = stock、journal 记为 `FAILURE`、叠层载荷正常加载。
+
+遗留：回滚后权限是 `0644`（期望 `0555`，guard 的 chmod 路径待查）；“受限一次重试”未实现；
+ready 屏障还没接（载荷首帧后应写 `<journal>/ready`，否则正式使用时每次都会被判超时回滚）。
