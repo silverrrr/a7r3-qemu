@@ -25,6 +25,8 @@
 | 二级页面（选项弹窗） | ✅ | 点已选中的行 → 列出该行全部 SR 选项，点选即改值 |
 | 新旧菜单切换按钮 | ✅ | 右上角 44x44 双箭头图标，两种状态下都在同一位置 |
 | 关闭时交还原生画面 | ✅ | 打开前抓原生帧，关闭时回写（+ 20 ms 守卫） |
+| 事务化发布到只读 `/usr` | ✅ | preimage 校验 → 同 fs 暂存 → 硬链保留 → rename → fsync → remount ro |
+| 断电/中断自愈 | ✅ | 双槽 SHA-256 日志 + preload 里的 guard，三分支跨启动实测 |
 | 真机验证 | ⏳ | 需要一次真机会话（触摸尺度、60 fps 闪烁、MENU 键） |
 
 ## 2. 截图（QEMU 实拍，均为 640×480 面板）
@@ -73,6 +75,11 @@ payloads/            注入到相机进程里的 .so 源码
   menu_shell.c         A7C2 风格界面绘制
   gpu_shim_qemu.c      LD_PRELOAD shim（GPU ioctl 观测、面板写、按键）
   probe_menu.c         M0 探针（读设置树、dump 节点/属性）
+  nm_boot.c            preload stub：读事务日志、拉起 guard、加载叠层
+  publish.c            设备端发布器（设备内运行，freestanding ARM32）
+  guard.c              fail-closed 回滚守卫（STARTED/ACCEPTED/FAILURE）
+  journal_min.h        256 B 双槽事务记录 + 自带 SHA-256 引用
+  sha256_min.h         最小 SHA-256（发布器/守卫共用）
   scripts/             构建 / 安装脚本
 qemu/
   bionz.c              cxd90045 机器模型（LCD/Sugilite 2D/eMMC/DDR 等）
@@ -156,3 +163,64 @@ python3 payloads/scripts/nm-inspect.py 6              # 最近 6 帧的"年龄/�
 - 因使用本仓库导致的任何后果由使用者自负。
 
 详见 [NOTICE.md](NOTICE.md)。
+
+---
+
+## 附录 A. 事务化安装 / 回滚底座（QEMU 已验证，真机待验）
+
+除了菜单叠层，本仓库还沉淀了一套"把文件安全地写进只读 `/usr`、失败能自愈"的机制。
+设计不变量参考了 [kan-xx/a7r3-boot-runtime](https://github.com/kan-xx/a7r3-boot-runtime)
+（该仓库对 ld-2.11.2 与 remount-ro 的分析非常有用），实现为独立编写。
+
+### A.1 为什么需要
+
+`/usr` 是 ext2 只读挂载，`im.elf` 又映射着 `libIMDB.so` 等文件：直接 `rm` 后替换会让
+旧 inode 的 `nlink` 变 0，内核 `fs_may_remount_ro` 会拒绝把 `/usr` 挂回只读（`EBUSY`），
+相机下次启动行为不可控。所以必须：**先硬链保留，再 rename，最后验证 remount ro**。
+
+### A.2 四条硬性不变量（均已在 QEMU 实测）
+
+| 不变量 | 说明 |
+| --- | --- |
+| preimage 校验 | 目标文件的大小 + SHA-256 必须与预期完全一致才允许写 |
+| 硬链保留 | `rename` 前 `linkat(target, retained)`，保证被映射的旧 inode 始终可达 |
+| 同文件系统暂存 | 候选先写到目标分区内的 `*.standby`（rename 不能跨文件系统） |
+| 读回 + `EROFS` 验证 | 写完 `fsync` 目录、回读校验，再把 `/usr` 挂回 `ro`，并用 `open(O_WRONLY)` 得到 `EROFS` 证明 |
+
+失败路径：`renameat(retained, target)` 回滚、清理暂存、`remount ro`；任何一步失败都写
+`FAILURE` 日志。
+
+### A.3 双槽日志与 guard
+
+`journal_min.h` 定义 256 B 记录（`A7GXST01`、seq、phase、boot_id、old/new SHA、末尾 32 B
+自校验），两个槽交替写、按 seq 取最新。发布器写 `STARTED` → `ACCEPTED`（或 `FAILURE`）。
+
+`nm_boot.so` 在启动早期（preload）读日志：若最新是 `STARTED`，`fork` + `execve`
+`/setting/guard.elf` 后照常加载叠层；guard 最多等 90 s 让叠层写 `/setting/inst/ready`
+（首帧后写），等到就 `ACCEPTED` 并 remount ro，等不到就回滚 stock。重试遵循窄化条件：
+只有"前一条 ACCEPTED、最新 STARTED、三条 boot_id 互不相同"才允许等 ready，否则立即回滚。
+
+三条分支都有跨启动实测：
+
+| 场景 | guard 判定 | 结果 |
+| --- | --- | --- |
+| 正常发布 | `accepted` | 放行 |
+| 中断且无前一次 ACCEPTED | `retry_denied` | 立即回滚 |
+| 中断且前一次 ACCEPTED、跨启动 | `retry_allowed` | 等 ready → ACCEPTED |
+
+### A.4 相关文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `payloads/publish.c`、`payloads/sha256_min.h` | 设备端发布器（freestanding ARM32，自带 SHA-256） |
+| `payloads/guard.c`、`payloads/journal_min.h` | 回滚守卫与双槽日志格式 |
+| `payloads/nm_boot.c` | preload stub（读日志 + 拉起 guard + 加载叠层） |
+| `payloads/scripts/build-publish.sh`、`build-guard.sh`、`build-nm-boot.sh` | 构建 |
+| `payloads/scripts/install-*.sh`、`clean-retained.sh`、`repair-usr.sh`、`fix-imdb-mode.sh` | 安装与维护 |
+| `tools/test-sha256.c`、`tools/test-journal.c` | 宿主机单元测试（SHA-256 向量、journal 布局/往返/篡改） |
+
+### A.5 边界
+
+- 只在 QEMU 中验证；真机的写入尺度、断电窗口、官方更新包回滚尚未实测；
+- 发布器只处理"单个文件替换"，不处理分区级镜像；
+- 真机执行前请先完成只读探针与 `/setting` 写入演练，并保留完整备份。
