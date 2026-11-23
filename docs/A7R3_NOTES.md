@@ -6022,3 +6022,24 @@ PUB OK
   （`ac27f2e1…` vs `c5adc8f6…`），所以 preimage 必须用同一时刻的运行时回读值。
 
 已知缺陷：发布后文件权限变成 `0644`（原 `0555`），应 `fstat` + `fchmod` 保留原 mode。
+
+### 73.1 发布器补强：权限保留 + 故障注入
+
+复制 standby 后用 `fstat64` 读目标 mode（ARM `struct stat64` 偏移 16），`chmod` 到 standby
+再 rename，因此 `0555` 的 `libIMDB.so` 发布后仍是 `-r-xr-xr-x`。
+另加可选第 10 参数 `fail_after_stage`，在指定阶段成功后强制失败，用来验证回滚。
+
+在“verify 之后”（文件已替换的最危险位置）注入失败：
+
+```
+PUB stage=verify code=9 rc=0
+PUB stage=inject_fail code=12 rc=-777
+PUB stage=rollback_rename code=12 rc=0
+PUB stage=rollback_remount_ro code=12 rc=0
+```
+
+结果：内容回滚到旧版本、权限回到 `0555`、`/usr` 回到 `ro`、应用未重启。
+正常发布同样全阶段 rc=0 且 `PUB OK`，新 inode 70841 / 保留 inode 70842。
+
+⇒ 发布器现在具备：preimage + 自带 SHA-256、同文件系统暂存、硬链保留、原子 rename、
+目录 fsync、回读校验、remount ro + `EROFS` 验证、失败回滚、故障注入自测。

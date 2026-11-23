@@ -37,6 +37,8 @@ typedef long s32;
 #define SYS_renameat 329
 #define SYS_linkat   330
 #define SYS_unlinkat 328
+#define SYS_fstat64  197
+#define SYS_chmod    15
 
 #define AT_FDCWD      (-100)
 #define O_RDONLY      0
@@ -60,6 +62,7 @@ typedef long s32;
 #define STAGE_REMOUNT_RO    10
 #define STAGE_READONLY_CHECK 11
 #define STAGE_ROLLBACK      12
+#define STAGE_MODE          13
 
 static s32 sys1(s32 n, s32 a) {
     register s32 r7 __asm__("r7") = n;
@@ -198,6 +201,19 @@ static long copy_file(const char *src, const char *dst) {
     return 0;
 }
 
+/* st_mode lives at offset 16 in the ARM EABI struct stat64. */
+static int target_mode(const char *path) {
+    u8 st[160];
+    long fd = sys3(SYS_open, (s32)path, O_RDONLY, 0);
+    int mode = 0;
+    if (fd < 0) return 0;
+    if (sys3(SYS_fstat64, (s32)fd, (s32)st, 0) == 0)
+        mode = (int)st[16] | ((int)st[17] << 8) |
+               ((int)st[18] << 16) | ((int)st[19] << 24);
+    sys1(SYS_close, (s32)fd);
+    return mode;
+}
+
 static int remount(const char *mp, int ro) {
     long flags = MS_REMOUNT | (ro ? MS_RDONLY : 0);
     return (int)sys5(SYS_mount, 0, (s32)mp, 0, flags, 0);
@@ -222,11 +238,20 @@ static void say_stage(const char *name, int stage, int rc) {
     out(" rc="); out_dec(rc); out("\n");
 }
 
+#define MAYBE_FAIL(n) \
+    do { \
+        if (fail_after == (n)) { \
+            say_stage("inject_fail", STAGE_ROLLBACK, -777); \
+            goto rollback; \
+        } \
+    } while (0)
+
 int run(int argc, char **argv) {
     const char *mp, *target, *retained, *standby, *source;
     u8 want_old[32], want_new[32], got[32];
     long want_size, size = 0;
     int renamed = 0, linked = 0, staged = 0;
+    int fail_after = 0;
     long link_rc;
     int rc;
 
@@ -239,10 +264,17 @@ int run(int argc, char **argv) {
         out("HASH "); out_sha(h); out(" size="); out_dec((int)n); out("\n");
         return 0;
     }
-    if (argc != 9) {
+    if (argc != 9 && argc != 10) {
         out("PUB usage: <mount> <target> <retained> <standby> <source> "
-            "<oldsha> <newsha> <size>\n");
+            "<oldsha> <newsha> <size> [fail_after_stage]\n");
         return STAGE_ARG;
+    }
+    if (argc == 10) {
+        const char *p = argv[9];
+        while (*p >= '0' && *p <= '9') {
+            fail_after = fail_after * 10 + (*p++ - '0');
+        }
+        if (*p) return STAGE_ARG;
     }
     mp = argv[1]; target = argv[2]; retained = argv[3];
     standby = argv[4]; source = argv[5];
@@ -280,12 +312,22 @@ int run(int argc, char **argv) {
     say_stage("standby", STAGE_STANDBY, rc);
     if (rc) goto rollback;
     staged = 1;
+    {
+        int mode = target_mode(target);
+        if (mode > 0) {
+            int mrc = (int)sys3(SYS_chmod, (s32)standby, mode & 07777, 0);
+            say_stage("mode", STAGE_MODE, mrc);
+            if (mrc) goto rollback;
+        }
+    }
+    MAYBE_FAIL(STAGE_STANDBY);
     rc = (int)hash_file(standby, got, &size);
     if (rc || size != want_size || !mem_eq(got, want_new, 32)) {
         say_stage("standby_hash", STAGE_STANDBY_HASH, rc ? rc : -1);
         goto rollback;
     }
     say_stage("standby_hash", STAGE_STANDBY_HASH, 0);
+    MAYBE_FAIL(STAGE_STANDBY_HASH);
 
     /* keep the mapped old inode reachable before replacing it */
     /* linkat takes five arguments (olddirfd, oldpath, newdirfd, newpath, flags) */
@@ -297,6 +339,7 @@ int run(int argc, char **argv) {
     }
     linked = 1;
     say_stage("link", STAGE_LINK, 0);
+    MAYBE_FAIL(STAGE_LINK);
 
     if (sys4(SYS_renameat, AT_FDCWD, (s32)standby, AT_FDCWD, (s32)target) < 0) {
         say_stage("rename", STAGE_RENAME, -1);
@@ -304,10 +347,12 @@ int run(int argc, char **argv) {
     }
     renamed = 1; staged = 0;
     say_stage("rename", STAGE_RENAME, 0);
+    MAYBE_FAIL(STAGE_RENAME);
 
     rc = fsync_path_dir(mp);
     say_stage("fsync", STAGE_FSYNC, rc);
     if (rc) goto rollback;
+    MAYBE_FAIL(STAGE_FSYNC);
 
     rc = (int)hash_file(target, got, &size);
     if (rc || size != want_size || !mem_eq(got, want_new, 32)) {
@@ -315,6 +360,7 @@ int run(int argc, char **argv) {
         goto rollback;
     }
     say_stage("verify", STAGE_VERIFY, 0);
+    MAYBE_FAIL(STAGE_VERIFY);
 
     rc = remount(mp, 1);
     say_stage("remount_ro", STAGE_REMOUNT_RO, rc);
