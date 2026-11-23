@@ -458,19 +458,12 @@ static int any_starts(const char *name, const char *const *keys)
     return 0;
 }
 
-/* our own byte compare: a call to libc's memcmp would go through a lazy PLT
- * slot, and this firmware's dynamic linker only resolves preloaded objects
- * eagerly -- inside a dlopen()ed payload the first memcmp() jumps to 0.
- * (The crash that pinned this down: pc=0, LR pointing into this module's own
- * .data after NM_elf_base, two-stage loader only.) */
-static int nm_bytes_eq(const char *a, const char *b, unsigned n)
-{
-    unsigned i;
-    for (i = 0; i < n; i++)
-        if (a[i] != b[i])
-            return 0;
-    return 1;
-}
+/* NOTE: this used to be a hand-written byte compare because the first PLT
+ * call (memcmp) crashed when this DSO was dlopen()ed.  The real cause was
+ * ld-2.11.2 mis-reading DT_RELCOUNT with non-contiguous relocation tables
+ * under DT_BIND_NOW (a7r3-boot-runtime documents it, and our DSO had exactly
+ * that layout).  build-newmenu.sh now zeroes DT_RELCOUNT after linking, so
+ * plain libc calls through the PLT are safe again. */
 
 /* which of the eight tabs an item belongs to (first match wins) */
 static int tab_of_name(const char *name)
@@ -504,7 +497,7 @@ static int tab_of_name(const char *name)
 
     /* names arrive as the raw symbol ("cmnViewSettingNodeRootCustomButtonH"):
      * match against the part after the common prefix */
-    if (name && nm_bytes_eq(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1))
+    if (name && __builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) == 0)
         name += sizeof(SYM_PREFIX) - 1;
 
     if (any_starts(name, t_custom))
@@ -816,7 +809,7 @@ static int collect_items(unsigned long base)
         }
         if (bad || !nul)
             continue;
-        if (!nm_bytes_eq(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1))
+        if (__builtin_memcmp(name, SYM_PREFIX, sizeof(SYM_PREFIX) - 1) != 0)
             continue;
         /* st_value is the module-relative offset of the object, so the node
          * sits at base + st_value.  This is the only way addresses are made:

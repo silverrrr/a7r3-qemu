@@ -5943,3 +5943,16 @@ NM_getsr=0x151fe3f9
 - `boot-until-ready.sh` 成功只代表 viewer 活着；判断应用画完要看帧内容（§66.14 已记）。
 - 那个 ~1/3 概率的启动竞态依旧存在：`pc=0x041739c8 / 0x2275e780 (uxengine_res1)`
   是它，不是载荷问题（`pc` 非 0、LR=0、任务名不同）。
+
+### 70.1 两段式崩溃的根因：`DT_RELCOUNT`
+
+机内 `ld-2.11.2.so` 在 `DT_BIND_NOW` 且 `.rel.dyn` 与 `.rel.plt` 不连续时会误读
+`DT_RELCOUNT`，按 `R_ARM_RELATIVE` 覆写 GOT，导致首次 PLT 调用跳到 0。我们的载荷
+正好是这种布局（REL=0x260、RELSZ=0x5C0、JMPREL=0x958、RELCOUNT=182）。
+
+修复：链接后把 `DT_RELCOUNT` 置 0（新增 `payloads/scripts/patch-dt-relcount.py`，
+由 `build-newmenu.sh` 自动调用，并审计无 RWX、重定位连续性），然后把自写的字节比较
+撤掉、恢复 libc `memcmp` 作为回归证明。
+
+QEMU 两段式实测：`NM_BOOT loaded`、零异常、`NM_items=456`、`NM_refl=456`、
+`NM_refl_fb=0`，菜单显示真实值。证据：`docs/images/relcount-fix.png`。

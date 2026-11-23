@@ -8,6 +8,7 @@
 # the library is dlopen()ed at run time (two-stage loader, A7R3_NOTES 66).
 # Without it the library still builds and works as a plain LD_PRELOAD.
 set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
 cd /mnt/f/project/a7r3/analysis/payloads
 LIBS=/mnt/f/project/a7r3/analysis/libs
 EXTRA=""
@@ -24,6 +25,12 @@ clang --target=arm-linux-gnueabi -march=armv7-a -mfloat-abi=soft \
   -Wl,-z,now \
   $EXTRA \
   -o newmenu.so menu_overlay.c menu_shell.c
+
+# ld-2.11.2 on this camera mis-reads DT_RELCOUNT when the relocation tables are
+# not contiguous under DT_BIND_NOW, which makes the first PLT call jump to 0
+# (root cause of the two-stage pc=0 crash; see a7r3-boot-runtime).  Their
+# invariant: custom DSOs ship DT_RELCOUNT = 0 and never RWX.
+python3 "$HERE/patch-dt-relcount.py" newmenu.so
 
 echo "== newmenu.so $(stat -c %s newmenu.so) B"
 file newmenu.so
