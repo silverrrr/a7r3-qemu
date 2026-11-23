@@ -43,13 +43,6 @@ static u32 j_get32(const u8 *p) {
 static void j_put32(u8 *p, u32 v) {
     p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24);
 }
-static unsigned long j_get64(const u8 *p) {
-    return (unsigned long)j_get32(p) | ((unsigned long)j_get32(p + 4) << 32);
-}
-static void j_put64(u8 *p, unsigned long v) {
-    j_put32(p, (u32)v);
-    j_put32(p + 4, (u32)(v >> 32));
-}
 
 static void j_seal(u8 *rec) {
     struct sha s;
@@ -67,7 +60,8 @@ static void j_build(u8 rec[J_BYTES], unsigned long seq, u32 phase, u32 code,
     j_memcopy(rec, J_MAGIC, 8);
     j_put32(rec + 8, 1);            /* abi */
     j_put32(rec + 12, J_BYTES);
-    j_put64(rec + 16, seq);
+    j_put32(rec + 16, (u32)seq);   /* low word */
+    j_put32(rec + 20, 0);          /* high word: always 0 on this target */
     j_put32(rec + 24, phase);
     j_put32(rec + 28, code);
     j_put32(rec + 32, pid);
@@ -89,7 +83,7 @@ static int j_check(const u8 rec[J_BYTES], unsigned long *seq, u32 *phase,
     j_seal(copy);
     j_memcopy(digest, copy + J_SEAL_OFF, 32);
     if (!j_memequal(digest, rec + J_SEAL_OFF, 32)) return -1;
-    if (seq) *seq = j_get64(rec + 16);
+    if (seq) *seq = (unsigned long)j_get32(rec + 16);
     if (phase) *phase = j_get32(rec + 24);
     if (code) *code = j_get32(rec + 28);
     if (old_sha) j_memcopy((void *)old_sha, rec + 72, 32);

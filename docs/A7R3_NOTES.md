@@ -6194,3 +6194,23 @@ SLOT 1 valid=1 seq=0 phase=1 boot=aea20322-…
 在 dump 里打印 seq 原始 8 字节，确认是“没写入”还是“读错偏移”。
 
 其余结论不受影响：发布器主链路、guard 的三种判定、权限 0555 恢复均已跨启动验证。
+
+### 80.1 journal seq 修复
+
+`journal_min.h` 原用 `j_put64/j_get64`（`<<32`/`>>32`）存 `seq`，在 32 位 ARM 上是未定义行为，
+写进去的值读回恒为 0。改为**显式两个 u32**：偏移 16 存低 32 位、20 固定 0，读回只取低字。
+
+宿主机单测 `tools/test-journal.c`（16 项断言：magic/abi/size/seq/phase/code/pid/boot/两个 SHA/
+封装校验/篡改拒绝）通过；QEMU dump 显示 `SLOT 0 seq=2 phase=2`、`SLOT 1 seq=3 phase=1`，
+seq 自增与相位都正确。
+
+### 80.2 受限重试“允许分支”
+
+窄化条件要求 ACCEPTED 与 STARTED 来自**不同的两次启动**（三条 boot_id 互不相同）。
+本轮构造时误在 guest 里删了 `/usr/lib/libIMDB.so.retained*`，被映射的旧 inode `nlink→0`，
+`remount ro` 立即 `EBUSY`，`/usr` 留在 rw —— 这再次验证了 §71 的不变量：
+**运行中绝不能删除 retained 别名**。硬停后新增 `payloads/scripts/repair-usr.sh`（`e2fsck -fy`）
+修复了 ext2，复查 rc=0。
+
+下一轮的正确顺序（不手工干预）：启动 A 正常发布（ACCEPTED）→ 重启 B 只跑 `publish -7`
+（STARTED）→ 重启 C，guard 应判 `retry_allowed` 并等待 `ready` 后 `accept`。
