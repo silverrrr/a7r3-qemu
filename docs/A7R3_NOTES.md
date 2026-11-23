@@ -5981,3 +5981,44 @@ remount rw → cp → ln（旧 inode nlink=2） → mv（rename） → sync → 
 
 脚本：`payloads/scripts/publish_probe.sh`、`run-guest-cmd.sh`、`install-publish-probe.sh`、
 `verify-publish-probe.sh`。
+
+### 72.1 设备端发布器（C 实现，QEMU 全流程通过）
+
+`payloads/publish.c`：freestanding ARM32、静态、无 libc，自带 SHA-256
+（`payloads/sha256_min.h`，因为 guest busybox 没有 `cmp`/`md5sum`）。
+
+```
+publish.elf <mount> <target> <retained> <standby> <source> <oldsha> <newsha> <size>
+publish.elf hash <path>
+```
+
+阶段（退出码即阶段号，每步打印 `PUB stage=… rc=…`）：remount rw → preimage 校验 →
+把 source 复制成同文件系统的 standby 并校验 → `linkat(target, retained)`（5 参数）→
+`renameat` → fsync 目录 → 回读校验 → remount ro → 用 `EROFS` 证明只读；任一步失败则
+`renameat(retained, target)` 回滚。
+
+QEMU 实测（目标是被 `im.elf` 映射的 `libIMDB.so`）：
+
+```
+PUB stage=remount_rw code=2 rc=0
+PUB stage=preimage code=3 rc=0
+PUB stage=standby code=4 rc=0
+PUB stage=standby_hash code=5 rc=0
+PUB stage=link code=6 rc=0
+PUB stage=rename code=7 rc=0
+PUB stage=fsync code=8 rc=0
+PUB stage=verify code=9 rc=0
+PUB stage=remount_ro code=10 rc=0
+PUB stage=readonly_check code=11 rc=0
+PUB OK
+```
+
+发布后 `/usr` 回到 `ro`，新旧 inode 不同（70842 / 70841）且内容 SHA-256 一致，应用未重启。
+
+两个实测教训：
+
+* `linkat` 是 **5 参数**（含 flags），原来用 4 参数调用得到 `EINVAL`，发布器正确地停在第 6 阶段并回滚；
+* 被 `MAP_SHARED` 映射的模块，**运行时 page cache 内容 ≠ 磁盘内容**
+  （`ac27f2e1…` vs `c5adc8f6…`），所以 preimage 必须用同一时刻的运行时回读值。
+
+已知缺陷：发布后文件权限变成 `0644`（原 `0555`），应 `fstat` + `fchmod` 保留原 mode。
