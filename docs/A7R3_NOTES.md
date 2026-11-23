@@ -5956,3 +5956,28 @@ NM_getsr=0x151fe3f9
 
 QEMU 两段式实测：`NM_BOOT loaded`、零异常、`NM_items=456`、`NM_refl=456`、
 `NM_refl_fb=0`，菜单显示真实值。证据：`docs/images/relcount-fix.png`。
+
+### 71.1 `/usr` 硬链保留式发布（QEMU 实测）
+
+`/usr` 是 ext2 只读挂载，而 `im.elf` 已 `mmap` 了 `libIMDB.so` 等文件。替换时若先
+`rm` 旧文件（inode `nlink→0`），内核 `fs_may_remount_ro` 会因“仍被映射的零链接 inode”
+拒绝把 `/usr` 挂回 `MS_RDONLY`（`EBUSY`）。正确顺序是 rename 之前先 `linkat` 保留旧 inode。
+
+QEMU 里用 guest 内部的脚本对**被映射的** `libIMDB.so` 实测：
+
+```
+remount rw → cp → ln（旧 inode nlink=2） → mv（rename） → sync → remount ro
+```
+
+结果：目标与保留名 inode 不同（70841 vs 174）、内容哈希一致、**`/usr` 成功回到 `ro`**，
+`im.elf` 全程未重启。
+
+三个实测约束：
+
+1. guest 的 busybox 没有 `cmp`/`md5sum`，设备端发布器必须自带 SHA-256；
+2. 真机 `/usr` 只剩约 8.9 MB，不能做“整份 19.5 MB 文件复制+rename”；
+3. QEMU 镜像的 `libIMDB.so` 与真机 dump 不同（`c5adc8f6…` vs `0f4d6355…`），
+   真机安装的 preimage 必须用真机读回值。
+
+脚本：`payloads/scripts/publish_probe.sh`、`run-guest-cmd.sh`、`install-publish-probe.sh`、
+`verify-publish-probe.sh`。
