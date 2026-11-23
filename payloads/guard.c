@@ -293,6 +293,24 @@ int run(int argc, char **argv) {
     char ready[256], retained2[256];
     int rc;
 
+    /* diagnostic: guard.elf dump <journal_dir> */
+    if (argc == 3 && argv[1][0] == 'd' && argv[1][1] == 'u') {
+        struct slot s[2];
+        int k;
+        read_slots(argv[2], s);
+        for (k = 0; k < 2; k++) {
+            out("SLOT "); out_dec(k);
+            out(" valid="); out_dec(s[k].valid);
+            out(" seq="); out_dec((int)s[k].seq);
+            out(" phase="); out_dec((int)s[k].phase);
+            out(" boot=");
+            if (s[k].boot[0]) out(s[k].boot);
+            else out("-");
+            out("\n");
+        }
+        return 0;
+    }
+
     if (argc != 8 && argc != 9) {
         out("GUARD usage: <journal> <wait_s> <mount> <target> <retained> "
             "<standby> <stock> [mode]\n");

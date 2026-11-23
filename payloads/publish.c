@@ -233,6 +233,19 @@ static int read_text(const char *path, char *buf, int cap) {
     buf[n] = 0;
     return n;
 }
+
+/* binary-exact read: no NUL terminator appended, so `n` can be the full size */
+static long read_bin(const char *path, void *buf, long n) {
+    long fd = sys3(SYS_open, (s32)path, O_RDONLY, 0), got = 0;
+    if (fd < 0) return -1;
+    while (got < n) {
+        long r = sys3(SYS_read, (s32)fd, (s32)((u8 *)buf + got), n - got);
+        if (r <= 0) break;
+        got += r;
+    }
+    sys1(SYS_close, (s32)fd);
+    return got;
+}
 static void boot_id(char out[37]) {
     int i;
     for (i = 0; i < 36; i++) out[i] = 0;
@@ -261,7 +274,7 @@ static unsigned long journal_max_seq(const char *dir) {
     int k;
     for (k = 0; k < 2; k++) {
         if (slot_file(path, sizeof path, dir, k)) continue;
-        if (read_text(path, (char *)rec, J_BYTES) != J_BYTES) continue;
+        if (read_bin(path, rec, J_BYTES) != J_BYTES) continue;
         if (j_check(rec, &seq, 0, 0, 0, 0) != 1) continue;
         if (seq > best) best = seq;
     }
