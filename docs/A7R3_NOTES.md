@@ -6119,3 +6119,34 @@ NM_BOOT loaded
 
 遗留：回滚后权限是 `0644`（期望 `0555`，guard 的 chmod 路径待查）；“受限一次重试”未实现；
 ready 屏障还没接（载荷首帧后应写 `<journal>/ready`，否则正式使用时每次都会被判超时回滚）。
+
+### 77.1 ready 屏障接通（接受路径）
+
+- `payloads/menu_overlay.c`：首次 `resolve_nodes()` + `flip_map()` 之后写
+  `/setting/inst/ready`，代表载荷确实起来了；
+- `payloads/guard.c`：新增可选第 9 参数 `mode`（八进制），回滚时用它 `chmod` standby；
+  接受路径也先把 `/usr` remount 回 `ro` 再写 `ACCEPTED`；
+- `payloads/nm_boot.c`：guard 参数改为等待 **90 s**、mode **0555**。
+
+语义：发布器正常完成写 `ACCEPTED` → 下次开机放行；发布器中途退出只有 `STARTED` →
+下次开机 guard 等 `ready`，等到就把 `/usr` 挂回 `ro` 并补 `ACCEPTED`（保留新文件），
+90 s 等不到则回滚 stock 并写 `FAILURE`（fail-closed）。
+
+跨启动实测（模拟掉电后重启）：
+
+```
+NM_BOOT journal STARTED -> guard
+NM_BOOT guard_pid=0x8c
+GUARD stage=started rc=0
+NM_BOOT dlopen=0x6aaf8
+NM_BOOT loaded
+GUARD ready_seen
+GUARD stage=accept_remount_ro rc=0
+GUARD stage=accept rc=0
+```
+
+结果：`/usr` 为 `ro`、目标内容保留（未回滚）、`ready` 与 `state.b` 存在、journal 记为
+`ACCEPTED`。配合 §76 的“无 ready → 回滚”，两条分支都有实测。
+
+遗留：本次目标权限是 `0644`（上一轮回滚遗留），需再做一次完整的 `0555 → 掉电 → 回滚`
+验证确认 `mode=0555` 生效；“受限一次重试”仍未实现；`ready` 文件需在下次发布前清理。

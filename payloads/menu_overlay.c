@@ -3607,6 +3607,15 @@ static void *worker(void *arg)
             log_hex("NM_FIRST_PAINT=", (unsigned long)now);
             resolve_nodes();
             flip_map();
+            /* tell the install guard that this payload really came up; the
+             * guard waits for this file before deciding a staged install is
+             * healthy (see pub/guard in NOTES 74/76) */
+            {
+                int rf = (int)sys3(SYS_open, (long)"/setting/inst/ready",
+                                   O_TRUNC_CREAT, 0644);
+                if (rf >= 0)
+                    sys2(SYS_close, rf, 0);
+            }
             /* a key/touch file left over from a previous run must not fire now */
             sys3(SYS_unlink, (long)"/tmp/nm_key", 0, 0);
             sys3(SYS_unlink, (long)"/tmp/nm_key.tmp", 0, 0);

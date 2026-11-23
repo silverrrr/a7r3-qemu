@@ -254,13 +254,13 @@ int run(int argc, char **argv) {
     u8 want_stock[32], got[32];
     unsigned long seq;
     u32 phase = 0, code = 0;
-    int found = 0, waited = 0, wait_max;
+    int found = 0, waited = 0, wait_max, want_mode = 0;
     char ready[256], retained2[256];
     int rc;
 
-    if (argc != 8) {
+    if (argc != 8 && argc != 9) {
         out("GUARD usage: <journal> <wait_s> <mount> <target> <retained> "
-            "<standby> <stock>\n");
+            "<standby> <stock> [mode]\n");
         return 2;
     }
     jdir = argv[1];
@@ -268,6 +268,11 @@ int run(int argc, char **argv) {
     { const char *p = argv[2]; while (*p >= '0' && *p <= '9') wait_max = wait_max * 10 + (*p++ - '0'); }
     mount = argv[3]; target = argv[4]; retained = argv[5];
     standby = argv[6]; stock = argv[7];
+    if (argc == 9) {
+        const char *p = argv[8];
+        while (*p >= '0' && *p <= '7') want_mode = want_mode * 8 + (*p++ - '0');
+        if (*p) return 2;
+    }
 
     /* the expected hash is the hash of the stock copy itself, so callers do not
      * have to carry it around */
@@ -293,6 +298,8 @@ int run(int argc, char **argv) {
     }
     if (waited < wait_max) {
         out("GUARD ready_seen\n");
+        rc = remount(mount, 1);
+        say("accept_remount_ro", rc);
         rc = write_slot(jdir, seq + 1, J_ACCEPTED, 0);
         say("accept", rc);
         return rc ? 1 : 0;
@@ -311,7 +318,7 @@ int run(int argc, char **argv) {
     say("standby", rc);
     if (rc) goto fail;
     {
-        int mode = target_mode(target);
+        int mode = want_mode ? want_mode : target_mode(target);
         if (mode > 0) sys3(SYS_chmod, (s32)standby, mode & 07777, 0);
     }
     if (sys5(SYS_linkat, AT_FDCWD, (s32)target, AT_FDCWD, (s32)retained2, 0) < 0) {

@@ -257,11 +257,11 @@ static int journal_started(void)
 static void maybe_guard(void)
 {
     static char *argv[] = {
-        (char *)"/setting/guard.elf", (char *)"/setting/inst", (char *)"20",
+        (char *)"/setting/guard.elf", (char *)"/setting/inst", (char *)"90",
         (char *)"/usr", (char *)"/usr/lib/libIMDB.so",
         (char *)"/usr/lib/libIMDB.so.retained",
         (char *)"/usr/lib/.libIMDB.standby",
-        (char *)"/setting/inst/stock.so", (char *)0
+        (char *)"/setting/inst/stock.so", (char *)"0555", (char *)0
     };
     static char *envp[] = { (char *)0 };
     long pid;
